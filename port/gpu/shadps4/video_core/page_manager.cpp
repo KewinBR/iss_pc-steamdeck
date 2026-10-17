@@ -163,28 +163,29 @@ struct PageManager::Impl {
         return handled;
     }
 
-    // tlg: TLG_LAGGED_READS=<offset>[,<offset>...]: guest instructions (offsets in the eboot
-    // image, hex) whose reads may see GPU data one frame old instead of waiting for the GPU
-    // (inFAMOUS: the auto exposure sum of the luminance tiles). See BufferCache::LaggedRead.
-    static bool IsLaggedReadSite(void* context) {
-        static const std::vector<u64> sites = [] {
-            std::vector<u64> list;
-            const char* e = std::getenv("TLG_LAGGED_READS");
-            for (const char* p = e; p && *p;) {
-                char* end = nullptr;
-                const u64 offset = std::strtoull(p, &end, 16);
-                if (end == p) {
-                    break;
-                }
-                list.push_back(offset);
-                p = *end ? end + 1 : end;
+    // tlg: per-instruction fault policies. TLG_LAGGED_READS / TLG_NOWAIT_WRITES=<offset>[,...]:
+    // guest instructions (offsets in the eboot image, hex) whose read faults take GPU data one
+    // frame old instead of waiting for the GPU (inFAMOUS: the auto exposure sum of the luminance
+    // tiles; BufferCache::LaggedRead), and whose write faults take the page over without reading
+    // the GPU data back (inFAMOUS: the per-object matrices; BufferCache::NoWaitWrite).
+    static std::vector<u64> ParseSites(const char* name, const char* what) {
+        std::vector<u64> list;
+        const char* e = std::getenv(name);
+        for (const char* p = e; p && *p;) {
+            char* end = nullptr;
+            const u64 offset = std::strtoull(p, &end, 16);
+            if (end == p) {
+                break;
             }
-            if (!list.empty()) {
-                std::printf("Lagged reads: %zu guest instruction(s) read GPU data without waiting\n",
-                            list.size());
-            }
-            return list;
-        }();
+            list.push_back(offset);
+            p = *end ? end + 1 : end;
+        }
+        if (!list.empty()) {
+            std::printf("%s: %zu guest instruction(s)\n", what, list.size());
+        }
+        return list;
+    }
+    static bool MatchSite(void* context, const std::vector<u64>& sites) {
         if (sites.empty()) {
             return false;
         }
@@ -192,6 +193,16 @@ struct PageManager::Impl {
         const u64 rip = reinterpret_cast<u64>(Common::GetRip(context)) - base;
         return base && rip < TlgGuestImage::size.load(std::memory_order_relaxed) &&
                std::find(sites.begin(), sites.end(), rip) != sites.end();
+    }
+    static bool IsLaggedReadSite(void* context) {
+        static const std::vector<u64> sites =
+            ParseSites("TLG_LAGGED_READS", "Lagged reads (GPU data without waiting)");
+        return MatchSite(context, sites);
+    }
+    static bool IsNoWaitWriteSite(void* context) {
+        static const std::vector<u64> sites =
+            ParseSites("TLG_NOWAIT_WRITES", "No-wait writes (pages taken over without readback)");
+        return MatchSite(context, sites);
     }
 
     static bool HandleGuestFault(void* context, VAddr addr) {
@@ -202,7 +213,8 @@ struct PageManager::Impl {
         }
         if (Common::IsWriteError(context)) {
             TlgStats::Timer timer{TlgStats::t_write_faults};
-            return rasterizer->OnWriteFault(addr, is_gpu_thread);
+            const bool nowait = !is_gpu_thread && IsNoWaitWriteSite(context);
+            return rasterizer->OnWriteFault(addr, is_gpu_thread, nowait);
         } else {
             TlgStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             TlgStats::Timer timer{TlgStats::t_read_faults};

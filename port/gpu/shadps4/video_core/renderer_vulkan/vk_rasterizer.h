@@ -175,7 +175,8 @@ public:
     /// in order with the draws handed over before it. Off by default.
     void RunForeign(std::function<void()> work);
     /// A guest write hit a protected page.
-    bool OnWriteFault(VAddr addr, bool assume_locks);
+    /// tlg: nowait: the fault comes from a TLG_NOWAIT_WRITES instruction (page_manager.cpp).
+    bool OnWriteFault(VAddr addr, bool assume_locks, bool nowait = false);
     /// tlg: lagged: the fault comes from a TLG_LAGGED_READS instruction (page_manager.cpp).
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false, bool lagged = false);
     void ProcessDownloadImages();

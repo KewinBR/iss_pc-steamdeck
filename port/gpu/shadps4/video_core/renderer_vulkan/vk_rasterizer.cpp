@@ -2859,6 +2859,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 if (!desc.is_written && size >= HugeBindSize) {
                     NoteHugeBind(vsharp.base_address, size);
                 }
+                VideoCore::written_binding_source = {"shader", stage.pgm_hash};
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
@@ -3874,6 +3875,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
         }
+        VideoCore::written_binding_source = {"fill", 0};
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
     runtime.FillBuffer(buffer, offset, num_bytes, value);
@@ -3901,6 +3903,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (dst_gds) {
             return {gds_buffer, dst};
         }
+        VideoCore::written_binding_source = {"copy", 0};
         return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
     }();
     const vk::BufferCopy copy = {
@@ -4015,7 +4018,14 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
-bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
+bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks, bool nowait) {
+    // tlg: a no-wait write takes the page over at once (BufferCache::NoWaitWrite): no draw pipe
+    // drain, no GPU wait. Images there are still invalidated.
+    if (nowait && !assume_locks && IsMapped(addr, 8) && buffer_cache.NoWaitWrite(addr)) {
+        texture_cache.InvalidateMemory(addr, 8);
+        buffer_cache.ExtendWriteFault(addr);
+        return true;
+    }
     DrainDrawPipe();
     if (!InvalidateMemory(addr, 8, assume_locks)) {
         return false;

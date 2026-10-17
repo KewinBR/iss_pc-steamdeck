@@ -7,6 +7,7 @@
 #include <chrono>
 #include <array>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <algorithm>
 #include <bit>
@@ -182,7 +183,7 @@ struct ReadbackStats {
     /// count them.
     std::atomic<u64> guest_waits{0}, guest_wait_ns{0};
     /// Lagged reads (TLG_LAGGED_READS): faults served without a wait, copies written back.
-    std::atomic<u64> lagged{0}, lagged_recorded{0}, lagged_applied{0};
+    std::atomic<u64> lagged{0}, lagged_recorded{0}, lagged_applied{0}, nowait_writes{0};
     std::atomic<s64> window_start{0};
 };
 ReadbackStats& Readbacks() {
@@ -215,7 +216,7 @@ void ReportReadbacks() {
     std::printf("  deferred: %llu recorded, %llu joined (%llu without the GPU thread), %llu applied, "
                 "%llu stale (downloaded), guest wait %.1f ms, %.1f MB; eager: %llu pages copied, "
                 "%llu used, %llu stale unread, %llu skipped (backoff); lagged: %llu reads, "
-                "%llu copies recorded, %llu written\n",
+                "%llu copies recorded, %llu written; no-wait writes: %llu\n",
                 static_cast<unsigned long long>(r.deferred.exchange(0)),
                 static_cast<unsigned long long>(r.joined.exchange(0)),
                 static_cast<unsigned long long>(r.local_joined.exchange(0)),
@@ -228,7 +229,8 @@ void ReportReadbacks() {
                 static_cast<unsigned long long>(r.eager_skipped.exchange(0)),
                 static_cast<unsigned long long>(r.lagged.exchange(0)),
                 static_cast<unsigned long long>(r.lagged_recorded.exchange(0)),
-                static_cast<unsigned long long>(r.lagged_applied.exchange(0)));
+                static_cast<unsigned long long>(r.lagged_applied.exchange(0)),
+                static_cast<unsigned long long>(r.nowait_writes.exchange(0)));
     std::printf("  waits for a readback copy: %llu, %.1f ms\n",
                 static_cast<unsigned long long>(r.guest_waits.exchange(0)),
                 r.guest_wait_ns.exchange(0) / 1e6);
@@ -371,6 +373,26 @@ bool BufferCache::LaggedRead(VAddr device_addr, u64 size) {
     liverpool->SendCommand<false, true>([this, page, bytes] { StartLaggedReadback(page, bytes); });
     if (ReadbackStatsEnabled()) {
         Readbacks().lagged.fetch_add(1);
+    }
+    return true;
+}
+
+bool BufferCache::NoWaitWrite(VAddr device_addr) {
+    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise) {
+        return false;
+    }
+    const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+    // Copies in flight over the page must not land on the bytes about to be written.
+    MarkDeferredStale(page, TRACKER_BYTES_PER_PAGE, true);
+    MarkEagerStale(page, TRACKER_BYTES_PER_PAGE);
+    memory_tracker->MarkRegionAsCpuModifiedNoReadback(page, TRACKER_BYTES_PER_PAGE);
+    // The page is the CPU's now: what the GPU wrote there before is dropped, in order with the
+    // game's commands (GPU writes recorded after this mark it again). The game reuses these
+    // pages frame after frame (a ring), so the old GPU bytes are dead.
+    liverpool->SendCommand<false, true>(
+        [this, page] { gpu_modified_ranges.Subtract(page, TRACKER_BYTES_PER_PAGE); });
+    if (ReadbackStatsEnabled()) {
+        Readbacks().nowait_writes.fetch_add(1);
     }
     return true;
 }
@@ -604,10 +626,56 @@ void PrintBufferStats() {
 }
 } // namespace
 
+namespace {
+// tlg: TLG_WRITTEN_BINDINGS=1: every 5 s, the buffer ranges bound as written by shaders (the
+// whole range is marked GPU modified, whatever the shader stores), most bound first, to tell
+// which binding makes the pages CPU write faults wait on (TLG_FAULT_PROFILE) GPU modified.
+void NoteWrittenBinding(VAddr addr, u32 size) {
+    static const bool enabled = [] { const char* e = std::getenv("TLG_WRITTEN_BINDINGS"); return e && *e == '1'; }();
+    if (!enabled) {
+        return;
+    }
+    // TLG_WRITTEN_BINDINGS_RANGE=<lo>-<hi> (hex): only the bindings overlapping that range.
+    static const std::pair<VAddr, VAddr> range = [] {
+        const char* e = std::getenv("TLG_WRITTEN_BINDINGS_RANGE");
+        char* end = nullptr;
+        const VAddr lo = e ? std::strtoull(e, &end, 16) : 0;
+        const VAddr hi = end && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : ~VAddr{0};
+        return std::pair{lo, hi};
+    }();
+    if (addr + size <= range.first || range.second <= addr) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::map<std::tuple<VAddr, u32, const char*, u64>, u64> bindings;
+    static auto window = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    ++bindings[{addr, size, written_binding_source.kind, written_binding_source.hash}];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds(5)) {
+        return;
+    }
+    window = now;
+    std::vector<std::pair<std::tuple<VAddr, u32, const char*, u64>, u64>> top(bindings.begin(), bindings.end());
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::printf("Written bindings (5 s, %zu ranges; kind, shader):", top.size());
+    for (size_t i = 0; i < top.size() && i < 16; ++i) {
+        const auto& [b_addr, b_size, b_kind, b_hash] = top[i].first;
+        std::printf(" [%#llx+%#x x%llu %s %#llx]", static_cast<unsigned long long>(b_addr), b_size,
+                    static_cast<unsigned long long>(top[i].second), b_kind,
+                    static_cast<unsigned long long>(b_hash));
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+    bindings.clear();
+}
+} // namespace
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     if (is_written) {
         NoteGpuWriteForEager(device_addr, size);
+        NoteWrittenBinding(device_addr, size);
     }
     texture_cache.ResolveReadbacks(device_addr, size, true, ReadbackSource::BufferObtain);
     const bool stats = BufferStatsEnabled();

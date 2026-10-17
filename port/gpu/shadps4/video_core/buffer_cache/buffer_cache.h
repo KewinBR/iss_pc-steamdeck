@@ -41,6 +41,14 @@ class StagingBufferPool;
 
 namespace VideoCore {
 
+/// tlg: who binds the next written buffer (TLG_WRITTEN_BINDINGS diagnostic): a short kind and,
+/// for shader bindings, the program hash. Set by the caller of ObtainBuffer on its thread.
+struct WrittenBindingSource {
+    const char* kind = "?";
+    u64 hash = 0;
+};
+inline thread_local WrittenBindingSource written_binding_source;
+
 class TextureCache;
 class MemoryTracker;
 class PageManager;
@@ -112,6 +120,15 @@ public:
     /// written to memory once the GPU is done with it, for the next read. Guest threads.
     /// False when deferred readbacks are off: the caller reads back as usual.
     bool LaggedRead(VAddr device_addr, u64 size);
+
+    /// tlg: a write fault from a TLG_NOWAIT_WRITES instruction (the game fills records the CPU
+    /// owns, next to small values the GPU writes for itself in the same pages; inFAMOUS: the
+    /// per-object matrices, in a ring reused every frame). The faulting page becomes writable at
+    /// once, without reading the GPU data back: the GPU bytes there are dropped (dead data from
+    /// an earlier pass over the ring) and the whole page is uploaded from the CPU copy. Only for
+    /// pages whose GPU-written bytes the CPU never reads. Guest threads. False when readbacks
+    /// are not precise.
+    bool NoWaitWrite(VAddr device_addr);
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
