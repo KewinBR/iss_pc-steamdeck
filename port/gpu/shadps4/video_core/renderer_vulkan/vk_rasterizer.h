@@ -176,7 +176,8 @@ public:
     void RunForeign(std::function<void()> work);
     /// A guest write hit a protected page.
     bool OnWriteFault(VAddr addr, bool assume_locks);
-    bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// tlg: lagged: the fault comes from a TLG_LAGGED_READS instruction (page_manager.cpp).
+    bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false, bool lagged = false);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);

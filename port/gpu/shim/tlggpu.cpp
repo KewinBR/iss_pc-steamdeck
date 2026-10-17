@@ -403,6 +403,16 @@ extern "C" void tlggpu_set_wait_hooks(TlgGpuWaitBegin begin, TlgGpuWaitEnd end) 
     TlgFreeze::begin_hook.store(begin);
 }
 
+namespace TlgGuestImage {
+std::atomic<uintptr_t> base{0};
+std::atomic<uint64_t> size{0};
+} // namespace TlgGuestImage
+
+extern "C" void tlggpu_set_guest_image(uintptr_t base, uint64_t size) {
+    TlgGuestImage::size.store(size);
+    TlgGuestImage::base.store(base);
+}
+
 extern "C" void tlggpu_note_open(const char* guest_path) {
     TlgRegion::NoteOpen(guest_path);
 }

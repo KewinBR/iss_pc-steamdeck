@@ -80,6 +80,9 @@ int tlggpu_cpu_write(void *dst, const void *src, int fill, uint64_t size);
 typedef void (*TlgGpuWaitBegin)(const char *kind, const void *object, const char *name, uintptr_t frame);
 typedef void (*TlgGpuWaitEnd)(void);
 void tlggpu_set_wait_hooks(TlgGpuWaitBegin begin, TlgGpuWaitEnd end);
+/* Where the eboot image is (eboot vaddr 0 at `base`): per-instruction fault policies
+ * (TLG_LAGGED_READS) name guest instructions by their offset in it. */
+void tlggpu_set_guest_image(uintptr_t base, uint64_t size);
 /* Flip requests from the game, flips handed to the presenter, presents done, vblank ticks,
  * page-protection faults being handled now and handled so far. */
 typedef struct { uint64_t submitted, shown, presented, vblanks, faults_in_progress, faults_handled; } TlgGpuFrameCounters;

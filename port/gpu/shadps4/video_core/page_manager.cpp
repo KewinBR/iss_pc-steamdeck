@@ -47,6 +47,16 @@
 #else
 #include "common/spin_lock.h"
 #endif
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+// tlg: the eboot image, set by the loader (tlggpu_set_guest_image, gpu/shim/tlggpu.cpp).
+namespace TlgGuestImage {
+extern std::atomic<uintptr_t> base;
+extern std::atomic<uint64_t> size;
+} // namespace TlgGuestImage
 
 namespace VideoCore {
 
@@ -153,6 +163,37 @@ struct PageManager::Impl {
         return handled;
     }
 
+    // tlg: TLG_LAGGED_READS=<offset>[,<offset>...]: guest instructions (offsets in the eboot
+    // image, hex) whose reads may see GPU data one frame old instead of waiting for the GPU
+    // (inFAMOUS: the auto exposure sum of the luminance tiles). See BufferCache::LaggedRead.
+    static bool IsLaggedReadSite(void* context) {
+        static const std::vector<u64> sites = [] {
+            std::vector<u64> list;
+            const char* e = std::getenv("TLG_LAGGED_READS");
+            for (const char* p = e; p && *p;) {
+                char* end = nullptr;
+                const u64 offset = std::strtoull(p, &end, 16);
+                if (end == p) {
+                    break;
+                }
+                list.push_back(offset);
+                p = *end ? end + 1 : end;
+            }
+            if (!list.empty()) {
+                std::printf("Lagged reads: %zu guest instruction(s) read GPU data without waiting\n",
+                            list.size());
+            }
+            return list;
+        }();
+        if (sites.empty()) {
+            return false;
+        }
+        const uintptr_t base = TlgGuestImage::base.load(std::memory_order_relaxed);
+        const u64 rip = reinterpret_cast<u64>(Common::GetRip(context)) - base;
+        return base && rip < TlgGuestImage::size.load(std::memory_order_relaxed) &&
+               std::find(sites.begin(), sites.end(), rip) != sites.end();
+    }
+
     static bool HandleGuestFault(void* context, VAddr addr) {
         // tlg: the draw recording thread handles its faults inline too (vk_draw_pipe.h).
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
@@ -165,7 +206,8 @@ struct PageManager::Impl {
         } else {
             TlgStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             TlgStats::Timer timer{TlgStats::t_read_faults};
-            return rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            const bool lagged = !is_gpu_thread && IsLaggedReadSite(context);
+            return rasterizer->ReadMemory(addr, 8, is_gpu_thread, lagged);
         }
         return false;
     }

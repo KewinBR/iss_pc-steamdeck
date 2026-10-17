@@ -181,6 +181,8 @@ struct ReadbackStats {
     /// Waits for a readback copy tick (WaitReadbackTick): the scheduler's own waits do not
     /// count them.
     std::atomic<u64> guest_waits{0}, guest_wait_ns{0};
+    /// Lagged reads (TLG_LAGGED_READS): faults served without a wait, copies written back.
+    std::atomic<u64> lagged{0}, lagged_recorded{0}, lagged_applied{0};
     std::atomic<s64> window_start{0};
 };
 ReadbackStats& Readbacks() {
@@ -212,7 +214,8 @@ void ReportReadbacks() {
                 r.finish_ns.exchange(0) / 1e6, r.bytes.exchange(0) / 1048576.0);
     std::printf("  deferred: %llu recorded, %llu joined (%llu without the GPU thread), %llu applied, "
                 "%llu stale (downloaded), guest wait %.1f ms, %.1f MB; eager: %llu pages copied, "
-                "%llu used, %llu stale unread, %llu skipped (backoff)\n",
+                "%llu used, %llu stale unread, %llu skipped (backoff); lagged: %llu reads, "
+                "%llu copies recorded, %llu written\n",
                 static_cast<unsigned long long>(r.deferred.exchange(0)),
                 static_cast<unsigned long long>(r.joined.exchange(0)),
                 static_cast<unsigned long long>(r.local_joined.exchange(0)),
@@ -222,7 +225,10 @@ void ReportReadbacks() {
                 static_cast<unsigned long long>(r.eager_copied.exchange(0)),
                 static_cast<unsigned long long>(r.eager_used.exchange(0)),
                 static_cast<unsigned long long>(r.eager_stale.exchange(0)),
-                static_cast<unsigned long long>(r.eager_skipped.exchange(0)));
+                static_cast<unsigned long long>(r.eager_skipped.exchange(0)),
+                static_cast<unsigned long long>(r.lagged.exchange(0)),
+                static_cast<unsigned long long>(r.lagged_recorded.exchange(0)),
+                static_cast<unsigned long long>(r.lagged_applied.exchange(0)));
     std::printf("  waits for a readback copy: %llu, %.1f ms\n",
                 static_cast<unsigned long long>(r.guest_waits.exchange(0)),
                 r.guest_wait_ns.exchange(0) / 1e6);
@@ -351,6 +357,109 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 
 void BufferCache::ReleaseReadProtection(VAddr device_addr, u64 size) {
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+}
+
+bool BufferCache::LaggedRead(VAddr device_addr, u64 size) {
+    if (!DeferredReadbackEnabled() || TlgToggle::Disabled(TlgToggle::DeferredReadback)) {
+        return false;
+    }
+    const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+    const u64 bytes = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE) - page;
+    // The guest reads what memory holds now; the copy queued below lands there for the next
+    // read. In order with the game's commands, so it holds the GPU work submitted before it.
+    memory_tracker->UnmarkRegionAsGpuModified(page, bytes);
+    liverpool->SendCommand<false, true>([this, page, bytes] { StartLaggedReadback(page, bytes); });
+    if (ReadbackStatsEnabled()) {
+        Readbacks().lagged.fetch_add(1);
+    }
+    return true;
+}
+
+void BufferCache::StartLaggedReadback(VAddr page, u64 size) {
+    PruneDeferredReadbacks();
+    {
+        // A copy in flight over this page: the next read takes its result instead.
+        std::scoped_lock lock{deferred_mutex};
+        for (const auto& readback : deferred_readbacks) {
+            if (!readback->Done() && readback->start < page + size && page < readback->end) {
+                return;
+            }
+        }
+    }
+    const auto [arena, window_start, window_end] = GetReadbackWindow(page, size);
+    if (eager_count.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{eager_mutex};
+        ApplyEagerSubtractsLocked();
+    }
+    FlushMergedWrites(arena, page, size);
+    auto readback = std::make_shared<DeferredReadback>();
+    readback->lagged = true;
+    readback->arena_base = arena->cpu_addr;
+    readback->start = page;
+    readback->end = page + size;
+    // Not CollectDownloads: it only looks at pages the tracker still marks GPU modified, and
+    // LaggedRead already unmarked these. gpu_modified_ranges says what the GPU wrote.
+    u64 total_size_bytes = 0;
+    gpu_modified_ranges.ForEachInRange(page, size, [&](VAddr start, VAddr end) {
+        readback->copies.push_back(vk::BufferCopy{
+            .srcOffset = start - arena->cpu_addr,
+            .dstOffset = total_size_bytes,
+            .size = end - start,
+        });
+        total_size_bytes += Common::AlignUp(end - start, 64);
+    });
+    gpu_modified_ranges.Subtract(page, size);
+    if (total_size_bytes == 0) {
+        return;
+    }
+    readback->staging =
+        staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 0, true);
+    for (auto& copy : readback->copies) {
+        copy.dstOffset += readback->staging.offset;
+    }
+    runtime.CopyBuffer(arena, readback->staging.buffer, readback->copies);
+    readback->tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    if (ReadbackStatsEnabled()) {
+        Readbacks().lagged_recorded.fetch_add(1);
+    }
+    std::scoped_lock lock{deferred_mutex};
+    deferred_readbacks.push_back(std::move(readback));
+    deferred_count.store(static_cast<u32>(deferred_readbacks.size()), std::memory_order_release);
+}
+
+bool BufferCache::ApplyLaggedReadback(DeferredReadback& readback, bool wait) {
+    if (wait) {
+        scheduler.GetWorkSemaphore()->Wait(readback.tick);
+    } else if (!scheduler.IsFree(readback.tick)) {
+        return false;
+    }
+    std::scoped_lock lock{readback.mutex};
+    if (readback.Done()) {
+        return true;
+    }
+    readback.staging.Invalidate();
+    const u8* const mapped = readback.staging.mapped - readback.staging.offset;
+    for (const auto& copy : readback.copies) {
+        const VAddr copy_start = readback.arena_base + copy.srcOffset;
+        const VAddr copy_end = copy_start + copy.size;
+        for (VAddr page = Common::AlignDown(copy_start, TRACKER_BYTES_PER_PAGE); page < copy_end;
+             page += TRACKER_BYTES_PER_PAGE) {
+            // A CPU write since the copy was recorded is newer than it.
+            if (memory_tracker->IsRegionCpuModified(page, TRACKER_BYTES_PER_PAGE)) {
+                continue;
+            }
+            const VAddr lo = std::max<VAddr>(page, copy_start);
+            const VAddr hi = std::min<VAddr>(page + TRACKER_BYTES_PER_PAGE, copy_end);
+            memory->TryWriteBacking(reinterpret_cast<void*>(lo),
+                                    mapped + copy.dstOffset + (lo - copy_start), hi - lo);
+        }
+    }
+    readback.applied.store(true, std::memory_order_release);
+    if (ReadbackStatsEnabled()) {
+        Readbacks().lagged_applied.fetch_add(1);
+    }
+    return true;
 }
 
 u64 BufferCache::CollectDownloads(const Buffer* arena, VAddr device_addr, u64 size,
@@ -1087,7 +1196,8 @@ std::shared_ptr<BufferCache::DeferredReadback> BufferCache::StartDeferredReadbac
         // Another guest thread is already waiting for this memory: wait for the same copy.
         std::scoped_lock lock{deferred_mutex};
         for (const auto& readback : deferred_readbacks) {
-            if (!readback->Done() && !readback->stale && readback->start <= window_start &&
+            if (!readback->Done() && !readback->stale && !readback->lagged &&
+                readback->start <= window_start &&
                 window_end <= readback->end) {
                 if (ReadbackStatsEnabled()) {
                     Readbacks().joined.fetch_add(1);
@@ -1215,6 +1325,11 @@ void BufferCache::SettleDeferredReadbacks(VAddr start, VAddr end) {
         }
     }
     for (const auto& readback : overlapping) {
+        if (readback->lagged) {
+            // Its ranges left gpu_modified_ranges: its bytes go to memory before a newer copy.
+            ApplyLaggedReadback(*readback, true);
+            continue;
+        }
         // A stale copy won't be applied: no need to wait for it (2d2511fe).
         if (readback->stale.load() || !FinishDeferredReadback(*readback, true)) {
             RecoverDeferredReadback(*readback);
@@ -1226,17 +1341,25 @@ void BufferCache::PruneDeferredReadbacks() {
     if (!deferred_count.load(std::memory_order_acquire)) {
         return;
     }
-    boost::container::small_vector<std::shared_ptr<DeferredReadback>, 8> stale;
+    boost::container::small_vector<std::shared_ptr<DeferredReadback>, 8> stale, lagged;
     {
         std::scoped_lock lock{deferred_mutex};
         for (const auto& readback : deferred_readbacks) {
-            if (!readback->Done() && readback->stale.load()) {
+            if (readback->Done()) {
+                continue;
+            }
+            if (readback->lagged) {
+                lagged.push_back(readback);
+            } else if (readback->stale.load()) {
                 stale.push_back(readback);
             }
         }
     }
     for (const auto& readback : stale) {
         RecoverDeferredReadback(*readback);
+    }
+    for (const auto& readback : lagged) {
+        ApplyLaggedReadback(*readback, false); // once the GPU is done with it
     }
     std::scoped_lock lock{deferred_mutex};
     std::erase_if(deferred_readbacks, [this](const std::shared_ptr<DeferredReadback>& readback) {

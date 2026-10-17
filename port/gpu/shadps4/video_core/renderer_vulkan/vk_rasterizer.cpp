@@ -4024,7 +4024,12 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
     return true;
 }
 
-bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
+bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks, bool lagged) {
+    // tlg: a lagged read takes the bytes already in memory (the GPU data of an earlier frame)
+    // and only queues the copy for the next read: no draw pipe drain, no GPU wait.
+    if (lagged && !assume_locks && IsMapped(addr, size) && buffer_cache.LaggedRead(addr, size)) {
+        return true;
+    }
     DrainDrawPipe();
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.

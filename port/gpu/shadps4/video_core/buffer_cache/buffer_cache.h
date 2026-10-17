@@ -105,6 +105,14 @@ public:
     /// faulting thread instead of a round trip through the GPU command thread.
     void ReleaseReadProtection(VAddr device_addr, u64 size);
 
+    /// tlg: a read fault from a TLG_LAGGED_READS instruction (a value the game smooths over
+    /// frames, such as the auto exposure). The read protection of the faulting page is lifted
+    /// at once, so the guest reads the bytes already there: the GPU data of an earlier frame.
+    /// The copy of the newer data is only queued (in order, on the GPU command thread) and
+    /// written to memory once the GPU is done with it, for the next read. Guest threads.
+    /// False when deferred readbacks are off: the caller reads back as usual.
+    bool LaggedRead(VAddr device_addr, u64 size);
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
@@ -231,6 +239,10 @@ private:
         u64 tick{};
         std::atomic<bool> stale{};
         std::atomic<bool> applied{};
+        /// A lagged read's copy (LaggedRead): written to memory as it is once the GPU is done,
+        /// never joined, never waited for by a guest thread, never marked out of date (its data
+        /// is older than the GPU writes that follow it on purpose).
+        bool lagged{};
         /// Won't be applied; its ranges are back in gpu_modified_ranges.
         std::atomic<bool> recovered{};
         std::mutex mutex;
@@ -259,6 +271,12 @@ private:
     std::shared_ptr<DeferredReadback> PendingDeferredReadback(VAddr device_addr, u64 size);
     /// Waits for the copy (if `wait`) and applies it. False when it is stale. Any thread.
     bool FinishDeferredReadback(DeferredReadback& readback, bool wait);
+    /// Records the copy of a lagged read's pages. GPU-side threads.
+    void StartLaggedReadback(VAddr page, u64 size);
+    /// Writes a lagged read's copy to memory, waiting for the GPU if `wait`; false while the
+    /// GPU is not done and `wait` is false. Pages the CPU wrote since are left alone. GPU-side
+    /// threads.
+    bool ApplyLaggedReadback(DeferredReadback& readback, bool wait);
     /// Puts the ranges of a copy that won't be applied back into gpu_modified_ranges.
     /// GPU-side threads.
     void RecoverDeferredReadback(DeferredReadback& readback);
