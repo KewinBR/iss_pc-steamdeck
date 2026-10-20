@@ -83,6 +83,17 @@ struct Liverpool {
     void NotePendingFences(const auto& event);
     bool PendingFenceValue(VAddr address, u32& value);
     void NotePendingWrite(const struct PM4CmdWriteData& write_data, u32 num_bytes);
+    /// tlg: TLG_OCCLUSION_MODE=4: results of the latest guest occlusion queries (end dumps).
+    /// Counted or not, every high half holds the valid bit and every begin counter 0: a
+    /// WaitRegMem on those dwords is met without reading memory the GPU writes (a readback).
+    struct OcclusionResults {
+        VAddr address;
+        u32 size;
+    };
+    std::array<OcclusionResults, 64> occlusion_results{};
+    u32 next_occlusion_result{};
+    void NoteOcclusionDump(VAddr address, u32 num_pairs);
+    bool KnownOcclusionValue(VAddr address, u32& value) const;
     /// tlg: running checksum of graphics-register packets (see ApplyGraphicsRegisterPacket).
     u64 gfx_reg_checksum{};
     /// Top-level graphics submissions, numbered for the draw preparation workers.

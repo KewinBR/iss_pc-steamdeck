@@ -36,6 +36,7 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+class OcclusionQueries;
 
 class Rasterizer {
 public:
@@ -94,6 +95,10 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// tlg: guest occlusion counter dump (ZPASS_DONE) with TLG_OCCLUSION_MODE=4, run in order
+    /// with the draws: counted by Vulkan occlusion queries (vk_occlusion.h); a query that
+    /// cannot be counted gets the zero counts of mode 3 (hidden).
+    void OcclusionDump(VAddr address, u32 num_pairs);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).
@@ -405,6 +410,9 @@ private:
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
     std::unique_ptr<TemporalUpscaler> upscaler; // tlg: FSR (docs/upscaler.md)
+    std::unique_ptr<OcclusionQueries> occlusion; // tlg: TLG_OCCLUSION_MODE=4 only
+    /// tlg: mode 3's zero counts for the num_pairs counter pairs at address.
+    void WriteHiddenOcclusion(VAddr address, u32 num_pairs);
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     const bool host_markers_enabled;

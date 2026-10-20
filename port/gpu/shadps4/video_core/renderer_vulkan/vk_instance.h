@@ -137,6 +137,16 @@ public:
         return vk12_features.shaderInt8;
     }
 
+    /// tlg: occlusion queries may count the exact number of samples (TLG_OCCLUSION_MODE=4).
+    bool IsOcclusionQueryPreciseSupported() const {
+        return features.occlusionQueryPrecise;
+    }
+
+    /// tlg: queries may be reset from the host (vkResetQueryPool).
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
+    }
+
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;

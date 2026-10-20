@@ -390,6 +390,18 @@ void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
         });
 }
 
+// tlg: TLG_OCCLUSION_MODE=4: a ZPASS_DONE dump, counted by Vulkan occlusion queries.
+struct OcclusionDumpTask {
+    VAddr address;
+    u32 num_pairs;
+};
+
+void RunOcclusionDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    OcclusionDumpTask task;
+    std::memcpy(&task, data, sizeof(task));
+    rasterizer.OcclusionDump(task.address, task.num_pairs);
+}
+
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
     // Copies deferred to the recording thread precede writes the guest sees.
@@ -439,6 +451,40 @@ void Liverpool::NotePendingWrite(const PM4CmdWriteData& write_data, u32 num_byte
     std::memcpy(&data, write_data.data, num_bytes);
     pending_fences.push_back(
         {write_data.Address<VAddr>(), data, num_bytes, rasterizer->DrawPipeHead()});
+}
+
+void Liverpool::NoteOcclusionDump(VAddr address, u32 num_pairs) {
+    const VAddr results = address & ~VAddr{15};
+    const u32 size = std::clamp<u32>(num_pairs, 1, 16) * 2 * sizeof(u64);
+    // A query begun again at these results: not known until its end dump.
+    for (auto& r : occlusion_results) {
+        if (r.size && results < r.address + r.size && r.address < results + size) {
+            r = {};
+        }
+    }
+    if (address % 16 == sizeof(u64)) {
+        occlusion_results[next_occlusion_result] = {results, size};
+        next_occlusion_result = (next_occlusion_result + 1) % occlusion_results.size();
+    }
+}
+
+bool Liverpool::KnownOcclusionValue(VAddr address, u32& value) const {
+    for (const auto& r : occlusion_results) {
+        if (!r.size || address < r.address || address >= r.address + r.size) {
+            continue;
+        }
+        switch ((address - r.address) % (2 * sizeof(u64)) / sizeof(u32)) {
+        case 0: // begin counter, low half
+            value = 0;
+            return true;
+        case 2: // end counter, low half: the samples, known once the GPU is done
+            return false;
+        default: // high halves: valid bit
+            value = 0x80000000U;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
@@ -1190,6 +1236,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
+                        // tlg: mode 4 = real occlusion queries, in order with the draws.
+                        if (rasterizer && Common::Backports::OcclusionMode() == 4) {
+                            const OcclusionDumpTask task{event->Address<VAddr>(),
+                                                         static_cast<u32>(num_counter_pairs)};
+                            NoteOcclusionDump(task.address, task.num_pairs);
+                            if (rasterizer->RunInOrder(&RunOcclusionDump, &task, sizeof(task))) {
+                                rasterizer->NotePendingGpuWrite(
+                                    task.address & ~VAddr{15},
+                                    std::clamp<u32>(task.num_pairs, 1, 16) * 2 * sizeof(u64) + 16);
+                            }
+                            break;
+                        }
                         // tlg: occlusion probe (TLG_OCCLUSION_LOG=1 logs the events; TLG_OCCLUSION_MODE
                         // 0 = fake counter as before, 1 = both slots equal (nothing visible), 2 = end far
                         // above begin (everything visible), 3 = zero counts: the default).
@@ -1329,6 +1387,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
+                }
+                // tlg: occlusion results (mode 4) whose value is known: no readback; and a wait
+                // that is always met reads nothing (mode 4 only, the other modes as before).
+                if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                    Common::Backports::OcclusionMode() == 4) {
+                    if (wait_reg_mem->function.Value() == PM4CmdWaitRegMem::Function::Always) {
+                        break;
+                    }
+                    if (u32 value; KnownOcclusionValue(wait_reg_mem->Address<VAddr>(), value) &&
+                                   wait_reg_mem->TestValue(value)) {
+                        break;
+                    }
                 }
                 // tlg: a fence handed to the draw recording thread counts as written: that
                 // thread runs everything in stream order.
