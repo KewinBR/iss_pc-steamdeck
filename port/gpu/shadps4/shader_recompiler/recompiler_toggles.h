@@ -91,9 +91,10 @@ inline bool ReadFirstLaneAll() {
 /// Compute shaders read the stride of a buffer from the V# the dispatch binds (its dword 1 in the
 /// flattened user data) instead of compiling it in, so one module serves every stride and the
 /// stride leaves the specialization (UsesDynamicStride in info.h decides per buffer). From the
-/// Castlesea inFAMOUS port (ISS_DYNAMIC_STRIDE, 8e167dc). TLG_DYNAMIC_STRIDE=0/1; default off.
+/// Castlesea inFAMOUS port (ISS_DYNAMIC_STRIDE, 8e167dc). TLG_DYNAMIC_STRIDE=0/1; default on for
+/// inFAMOUS only (2026-10-20: the GPU smoke stopped flickering, #7/#50, in the player's test).
 inline bool DynamicBufferStride() {
-    static const bool enabled = Detail::EnvFlag("TLG_DYNAMIC_STRIDE", [] { return false; });
+    static const bool enabled = Detail::EnvFlag("TLG_DYNAMIC_STRIDE", &Detail::InfamousDefault);
     return enabled;
 }
 
