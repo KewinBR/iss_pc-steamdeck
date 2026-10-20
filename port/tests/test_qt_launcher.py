@@ -254,15 +254,18 @@ class BackendTests(unittest.TestCase):
         backend.resetFixes('defaults')
         self.assertTrue(backend.profileIsRecommended)
 
-    def test_occlusion_selector_defaults_to_3_and_saves_through_the_fix_path(self):
+    def test_occlusion_selector_defaults_to_4_and_saves_through_the_fix_path(self):
         backend, saved = self.make()
-        self.assertEqual(['0', '1', '2', '3'], [o['value'] for o in backend.occlusionOptions])
-        self.assertEqual(3, backend.occlusionIndex)
+        self.assertEqual(['0', '1', '2', '3', '4'], [o['value'] for o in backend.occlusionOptions])
+        self.assertEqual(4, backend.occlusionIndex)
         backend.setOcclusion('1')
         self.assertEqual(1, backend.occlusionIndex)
         self.assertEqual('1', saved[-1]['TLG_OCCLUSION_MODE'])
         backend.setOcclusion('3')
         self.assertEqual(3, backend.occlusionIndex)
+        self.assertEqual('3', saved[-1]['TLG_OCCLUSION_MODE'])
+        backend.setOcclusion('4')
+        self.assertEqual(4, backend.occlusionIndex)
 
     def test_game_language_list_is_auto_then_game_languages_in_order(self):
         backend, _ = self.make()

@@ -244,18 +244,21 @@ DIAGNOSTICS = [
         ('Still crashes the game on the NVIDIA 595 driver; off by default in this port.',
          'Ainda derruba o jogo no driver NVIDIA 595; desligado por padrão neste port.'),
         broken=True),
-    _ab_choice('occlusion_mode', 'TLG_OCCLUSION_MODE', '3',
+    _ab_choice('occlusion_mode', 'TLG_OCCLUSION_MODE', '4',
                (('0', '0 · As before (fake counter, glare may show through)', '0 · Como antes (contador falso, o brilho pode atravessar)'),
                 ('1', '1 · Lights count as hidden', '1 · Luzes contam como tapadas'),
                 ('2', '2 · Lights count as fully visible', '2 · Luzes contam como totalmente visíveis'),
-                ('3', '3 · Zero counts (recommended)', '3 · Contagem zero (recomendado)')),
+                ('3', '3 · Zero counts (previous default)', '3 · Contagem zero (padrão anterior)'),
+                ('4', '4 · Real occlusion, counted by the GPU (recommended)', '4 · Oclusão real, contada pela GPU (recomendado)')),
                ('Occlusion query (diagnostic)', 'Consulta de oclusão (diagnóstico)'),
                ('Test for the headlight glow that shows through characters and flickers: the counter the game '
                 'reads to know how much of a light is visible is a fake one. 1 = nothing visible, 2 = everything '
-                'visible, 3 = zero counts; 0 is the old behaviour; 3 is the default. Send the log and a screenshot of each mode.',
+                'visible, 3 = zero counts, 4 = real occlusion counted by the GPU (the default); 0 is the old behaviour. '
+                'Send the log and a screenshot of each mode.',
                 'Teste do brilho dos faróis que atravessa personagens e pisca: o contador que o jogo lê para saber '
                 'quanto de uma luz está visível é falso. 1 = nada visível, 2 = tudo visível, 3 = contagem zero; '
-                '0 é o comportamento antigo; 3 é o padrão. Mande o log e uma captura de cada modo.'),
+                '4 = oclusão real contada pela GPU (o padrão); 0 é o comportamento antigo. '
+                'Mande o log e uma captura de cada modo.'),
                source='diagnóstico (liverpool.cpp ZPASS_DONE)'),
     _ab('verbose_log', 'TLG_VERBOSE_LOG', False, False, False, ('Detailed log (for bug reports)', 'Log detalhado (para relatórios de problema)'),
         ('Turns on every safe trace switch, the GPU log at debug level, timestamps and thread ids on GPU lines, and extra '

@@ -206,16 +206,17 @@ A tela **Correções** do launcher (e o botão **Correções experimentais…** 
 
 ## Luzes e oclusão
 
-Os faróis piscavam e o brilho das luzes aparecia **através** dos personagens. A causa: o contador de oclusão (`ZPASS_DONE`) que o jogo lê para saber quanto de cada luz está visível era um número falso, que só crescia. Com o modo **3** (contagem zero, o padrão desta versão) o problema **foi corrigido, confirmado no Windows e no Linux**.
+Os faróis piscavam e o brilho das luzes aparecia **através** dos personagens. A causa: o contador de oclusão (`ZPASS_DONE`) que o jogo lê para saber quanto de cada luz está visível era um número falso, que só crescia. O modo **3** (contagem zero) corrigiu o problema, confirmado no Windows e no Linux, mas tratava todo brilho como tapado. O modo **4**, o padrão agora, mede a **oclusão real** pela GPU (consultas de oclusão do Vulkan, vindas do fork do weshayoub92 usado pelo [Castlesea](https://github.com/Castlesea/infamous-second-son-pc-port)): o brilho aparece quando a luz está à vista e some atrás de paredes e personagens.
 
 | `ISS_OCCLUSION_MODE` | Efeito |
 |---|---|
 | `0` | comportamento antigo (contador falso; o brilho pode atravessar) |
 | `1` | teste: as luzes contam como tapadas |
 | `2` | teste: as luzes contam como totalmente visíveis |
-| `3` | contagem zero: **padrão** |
+| `3` | contagem zero (padrão anterior) |
+| `4` | oclusão real, contada pela GPU: **padrão** |
 
-O seletor **Brilho das luzes (oclusão)** está na tela **Jogar** do launcher (e entre as chaves de diagnóstico); a variável também aceita o prefixo `TLG_`. **Risco:** em algumas cenas o brilho das luzes pode ficar mais fraco com o modo 3; se isso incomodar, use o modo 0. Esta é uma solução por aproximação; a oclusão real, medida pelo Vulkan, ainda não existe (veja o [roadmap](docs/ROADMAP.md)). Se você achar uma cena pior, mande o log e uma captura de cada modo.
+O seletor **Brilho das luzes (oclusão)** está na tela **Jogar** do launcher (e entre as chaves de diagnóstico); a variável também aceita o prefixo `TLG_`. Se alguma cena ficar pior com o modo 4, use o modo 3 e mande o log e uma captura de cada modo. `ISS_OCCLUSION_LOG=1` escreve no log quantas consultas foram contadas.
 
 ## Mouse
 
@@ -571,16 +572,17 @@ The launcher's **Fixes** screen (and the **Experimental fixes…** button of the
 
 ## Lights and occlusion
 
-Headlights flickered and the glare of lights showed up **through** characters. The cause: the occlusion counter (`ZPASS_DONE`) that the game reads to know how much of each light is visible was a fake number that only grew. With mode **3** (zero counts, the default of this version) the problem **was fixed, confirmed on Windows and on Linux**.
+Headlights flickered and the glare of lights showed up **through** characters. The cause: the occlusion counter (`ZPASS_DONE`) that the game reads to know how much of each light is visible was a fake number that only grew. Mode **3** (zero counts) fixed it, confirmed on Windows and on Linux, but treated every glare as hidden. Mode **4**, now the default, measures **real occlusion** on the GPU (Vulkan occlusion queries, from the weshayoub92 fork used by [Castlesea](https://github.com/Castlesea/infamous-second-son-pc-port)): the glare shows when the light is in view and disappears behind walls and characters.
 
 | `ISS_OCCLUSION_MODE` | Effect |
 |---|---|
 | `0` | old behavior (fake counter; glare may show through) |
 | `1` | test: lights count as hidden |
 | `2` | test: lights count as fully visible |
-| `3` | zero counts: **default** |
+| `3` | zero counts (previous default) |
+| `4` | real occlusion, counted by the GPU: **default** |
 
-The **Light glare (occlusion)** selector is on the launcher's **Play** screen (and among the diagnostic switches); the variable also takes the `TLG_` prefix. **Risk:** in some scenes the glare of lights may look weaker with mode 3; if that bothers you, use mode 0. This is an approximation; real occlusion, measured through Vulkan, does not exist yet (see the [roadmap](docs/ROADMAP.md)). If you find a scene that looks worse, send the log and a screenshot of each mode.
+The **Light glare (occlusion)** selector is on the launcher's **Play** screen (and among the diagnostic switches); the variable also takes the `TLG_` prefix. If a scene looks worse with mode 4, use mode 3 and send the log and a screenshot of each mode. `ISS_OCCLUSION_LOG=1` writes to the log how many queries were counted.
 
 ## Mouse
 

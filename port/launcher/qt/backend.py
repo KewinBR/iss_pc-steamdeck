@@ -626,7 +626,7 @@ class Backend(QObject):
 
     @Property('QVariantList', notify=profileChanged)
     def occlusionOptions(self):
-        """The four values of the "Light glare (occlusion)" selector on the Home screen."""
+        """The values of the "Light glare (occlusion)" selector on the Home screen."""
         item = self._occlusion_item()
         value = backports_table.effective(item, self.fix_states)
         return [{'value': v, 'label': self.t_.pair((en, pt)), 'on': v == value} for v, en, pt in item.choices]
