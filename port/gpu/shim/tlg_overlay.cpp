@@ -625,6 +625,7 @@ void FixesSection() {
         {"BLOCK1D", nullptr},
         {"BC_TINY", nullptr},
         {"NO_MSAA", nullptr},
+        {"DYNAMIC_STRIDE", Shader::Toggles::DynamicBufferStride},
     };
     static_assert(sizeof(extras) / sizeof(extras[0]) == TlgSettings::kExtraPrefs);
     if (BeginRows("##extras")) {

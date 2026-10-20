@@ -104,7 +104,7 @@ _GROUP_OF = {
     'TLG_ASYNC_SHADERS': 'perf', 'TLG_DEFERRED_READBACK': 'perf', 'TLG_STALE_READBACK': 'perf',
     'TLG_BACKGROUND_WARMUP': 'perf', 'TLG_DRAIN_SLEEP': 'perf',
     'BP09': 'tex', 'BP10': 'tex', 'TLG_BLOCK1D': 'tex', 'TLG_BC_TINY': 'tex', 'TLG_NO_MSAA': 'tex',
-    'BP06': 'exp', 'TLG_RFL_ALL': 'exp', 'TLG_PIPELINE_BINARIES': 'exp', 'TLG_VERBOSE_LOG': 'exp',
+    'BP06': 'exp', 'TLG_RFL_ALL': 'exp', 'TLG_DYNAMIC_STRIDE': 'exp','TLG_PIPELINE_BINARIES': 'exp', 'TLG_VERBOSE_LOG': 'exp',
 }
 
 
