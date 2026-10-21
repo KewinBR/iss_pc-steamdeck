@@ -47,7 +47,7 @@ static bool ShapeOk(const GraphicsPipeline& pipeline) {
     const auto check = [&](bool pass, u32 reason) {
         if (!pass && fail == ~0u) fail = reason;
     };
-    check(pipeline.UsesPushDescriptors() || NativeMaterial::SetsEnabled(), 0);
+    check(pipeline.UsesPushDescriptors() || NativeMaterial::SetsAt('2'), 0);
     const auto stages = pipeline.GetStages();
     const auto* vs = stages[u32(Shader::SwStage::Vertex)];
     const auto* ps = stages[u32(Shader::SwStage::Fragment)];
@@ -67,7 +67,7 @@ static bool ShapeOk(const GraphicsPipeline& pipeline) {
         for (const auto& image : stage->images) check(!image.is_written, 3);
     }
     // Vertex samplers: compared by the lean path like the others (ISS_NATIVE_GBUFFER_SETS).
-    check(!vs || vs->samplers.empty() || NativeMaterial::SetsEnabled(), 5);
+    check(!vs || vs->samplers.empty() || NativeMaterial::SetsAt('2'), 5);
     check(pipeline.GetFetchShader().attributes.size() <= MaxSharps, 6);
     const bool ok = fail == ~0u;
     if (!ok) ++ShapeFails()[fail];
@@ -479,6 +479,8 @@ u32 Rasterizer::NativeGbufferExecute(const iss::native_gbuffer::Batch& b,
                 BindVertexBuffers(pipeline);
                 BindIndexBuffer(0);
                 if (needs_barrier) runtime.FlushBarriers();
+                if (NativeMaterial::LayoutCheckEnabled() && !pipeline->UsesPushDescriptors())
+                    NativeMaterial::WritesMatchLayout(*pipeline, set_writes.data(), u32(set_writes.size()), "gbuffer");
                 pipeline->BindResources(set_writes, push_data);
                 UpdateDynamicState(pipeline, true);
                 if (attachment_feedback_loop) return stop();
@@ -564,6 +566,8 @@ u32 Rasterizer::NativeGbufferExecute(const iss::native_gbuffer::Batch& b,
             keep_vertex_input = false;
             BindIndexBuffer(0);
             if (needs_barrier) runtime.FlushBarriers();
+            if (NativeMaterial::LayoutCheckEnabled() && !current->UsesPushDescriptors())
+                NativeMaterial::WritesMatchLayout(*current, set_writes.data(), u32(set_writes.size()), "gbuffer");
             current->BindResources(set_writes, push_data);
             if (scheduler.CurrentTick() != state_tick) return stop();
             scheduler.BeginRendering(verifying ? NativeGbufferVerifyTargets(render_state)
@@ -615,6 +619,8 @@ u32 Rasterizer::NativeGbufferExecute(const iss::native_gbuffer::Batch& b,
             BindVertexBuffers(pipeline);
             BindIndexBuffer(0);
             if (needs_barrier) runtime.FlushBarriers();
+            if (NativeMaterial::LayoutCheckEnabled() && !pipeline->UsesPushDescriptors())
+                NativeMaterial::WritesMatchLayout(*pipeline, set_writes.data(), u32(set_writes.size()), "gbuffer");
             pipeline->BindResources(set_writes, push_data);
             UpdateDynamicState(pipeline, true);
             if (attachment_feedback_loop) return stop();

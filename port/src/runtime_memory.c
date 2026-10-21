@@ -297,15 +297,52 @@ static int pool(void) {
 }
 void runtime_memory_reserve(void) {}
 static int system_window_reserved(void) { return 1; }
+/* steam-deck: TLG_UNIFIED_DMABUF (ligado com ISS_UNIFIED_MEMORY=1 no renderer v2; =0 desliga). O RADV só importa
+ * ponteiro de memória anônima, e este pool é um memfd compartilhado: o heap unificado nunca ligava no Deck. Quando o
+ * jogo mapeia o heap (ISS_UNIFIED_RANGE, padrão 0x1048000000:0x20000000), a memória dele vem de um dma-buf alocado
+ * pelo Vulkan (tlggpu_unified_alloc, gpu_v2): a visão de apoio dessa janela física é remapeada nele, e todo
+ * mapeamento da janela usa o dma-buf. O renderer importa o mesmo dma-buf (BufferCache::EnableUnifiedDmaBuf). */
+extern int tlggpu_unified_alloc(uint64_t size) __attribute__((weak));
+static int unified_fd=-1;
+static uint64_t unified_phys, unified_size;
+static int unified_wanted(uintptr_t address, uint64_t size) {
+    static int on=-1;
+    static uint64_t base=0x1048000000ull, span=0x20000000ull;
+    if (on<0) {
+        const char *u=getenv("ISS_UNIFIED_MEMORY"), *d=getenv("TLG_UNIFIED_DMABUF"), *r=getenv("ISS_UNIFIED_RANGE");
+        on=u && u[0]=='1' && !(d && d[0]=='0') && tlggpu_unified_alloc;
+        if (r) {
+            char *end=NULL;
+            base=strtoull(r,&end,0);
+            if (end && *end==':') span=strtoull(end+1,NULL,0);
+        }
+    }
+    return on && unified_fd<0 && address==base && size==span;
+}
+static int in_unified(uint64_t phys, uint64_t size) {
+    return unified_fd>=0 && phys>=unified_phys && phys+size<=unified_phys+unified_size;
+}
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+    if (!reserved && unified_wanted(address,size)) {
+        int fd=tlggpu_unified_alloc(size);
+        if (fd>=0 && mmap(backing_base+phys,size,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0)!=MAP_FAILED) {
+            unified_fd=fd; unified_phys=phys; unified_size=size;
+            fprintf(stderr,"Runtime: unified heap 0x%" PRIxPTR " (%" PRIu64 " MB) on a dma-buf\n",address,size>>20);
+        } else {
+            fprintf(stderr,"Runtime: unified heap dma-buf failed (fd %d); memfd as before\n",fd);
+        }
+    }
     void *mapped = !reserved
-        ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
+        ? (in_unified(phys,size)
+               ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,unified_fd,(off_t)(phys-unified_phys))
+               : mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys))
         : mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED,-1,0);
     return mapped==MAP_FAILED ? -1 : 0;
 }
 static int host_unmap(uintptr_t address, uint64_t size) { return munmap((void *)address,size); }
 static int host_protect(uintptr_t address, uint64_t size, int prot) { return mprotect((void *)address,size,prot); }
 static void host_discard(uint64_t phys, uint64_t size) {
+    if (in_unified(phys,size)) { memset(backing_base+phys,0,size); return; } /* dma-buf: sem buracos */
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
 }
 #endif

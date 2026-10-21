@@ -45,6 +45,54 @@ static bool SetsEnabled() {
     }();
     return enabled;
 }
+// steam-deck (diagnostico): TLG_SETS_OFF=<digitos> tira os sets so de alguns caminhos (0 passes,
+// 1 recorder, 2 G-buffer), pra achar qual grava um set que nao bate com o layout.
+static bool SetsAt(char where) {
+    static const char* off = std::getenv("TLG_SETS_OFF");
+    if (!SetsEnabled()) return false;
+    if (!off) return true;
+    for (const char* p = off; *p; ++p)
+        if (*p == where) return false;
+    return true;
+}
+
+// steam-deck (diagnostico): TLG_LAYOUT_CHECK=1 confere gravacoes de descritor contra o layout do
+// pipeline (tipo e quantidade por binding, sem transbordar pra binding seguinte). Falso e registra
+// as primeiras divergencias.
+static bool LayoutCheckEnabled() {
+    static const bool on = [] {
+        const char* p = std::getenv("TLG_LAYOUT_CHECK");
+        return p && p[0] == '1';
+    }();
+    return on;
+}
+static bool WritesMatchLayout(const GraphicsPipeline& pipeline, const vk::WriteDescriptorSet* writes,
+                              u32 count, const char* where) {
+    const auto& layout = pipeline.GetLayoutBindings();
+    for (u32 i = 0; i < count; ++i) {
+        const auto& w = writes[i];
+        const vk::DescriptorSetLayoutBinding* b = nullptr;
+        for (const auto& lb : layout)
+            if (lb.binding == w.dstBinding) b = &lb;
+        const bool ok = b && b->descriptorType == w.descriptorType &&
+                        w.dstArrayElement + w.descriptorCount <= b->descriptorCount;
+        if (ok) continue;
+        static std::atomic<u32> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+            const auto& vs = pipeline.GetStage(Shader::SwStage::Vertex);
+            const auto& ps = pipeline.GetStage(Shader::SwStage::Fragment);
+            std::fprintf(stderr,
+                         "LAYOUT_MISMATCH %s vs %08llx ps %08llx write %u/%u binding %u type %d count %u+%u"
+                         " | layout %s type %d count %u (bindings %zu)\n",
+                         where, (unsigned long long)vs.pgm_hash, (unsigned long long)ps.pgm_hash, i, count,
+                         w.dstBinding, int(w.descriptorType), w.dstArrayElement, w.descriptorCount,
+                         b ? "tem" : "SEM", b ? int(b->descriptorType) : -1, b ? b->descriptorCount : 0,
+                         layout.size());
+        }
+        return false;
+    }
+    return true;
+}
 
 enum Special : u8 { Guest, Flat, ClipPlanes };
 struct BufferSlot {

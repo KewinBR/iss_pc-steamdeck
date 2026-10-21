@@ -490,7 +490,12 @@ struct Worker {
             const Use u = uses.front();
             uses.pop_front();
             tail = u.ring_end;
-            while (!full_pools.empty() && full_pools.front().last_user <= u.seq) {
+            // steam-deck: TLG_POOL_NO_RESET=1 (diagnostico) nunca recicla um pool cheio.
+            static const bool no_reset = [] {
+                const char* p = std::getenv("TLG_POOL_NO_RESET");
+                return p && p[0] == 1;
+            }();
+            while (!no_reset && !full_pools.empty() && full_pools.front().last_user <= u.seq) {
                 device.resetDescriptorPool(full_pools.front().pool);
                 free_pools.push_back(full_pools.front().pool);
                 full_pools.pop_front();
@@ -549,11 +554,16 @@ struct Worker {
             };
             vk::DescriptorSet set{};
             if (device.allocateDescriptorSets(&info, &set) == vk::Result::eSuccess) {
-                current_last_user = seq;
+                // steam-deck: the latest user, not the last caller. A thread can take sets for an
+                // older segment after a newer one; with "= seq" the pool was reset when the older
+                // one retired, under the newer one still on the GPU (SQC faults in the RADV 32 bit
+                // range with ISS_NATIVE_GBUFFER_SETS=1).
+                current_last_user = std::max(current_last_user, seq);
                 return set;
             }
             full_pools.push_back({current_pool, current_last_user});
             current_pool = vk::DescriptorPool{};
+            current_last_user = 0;
         }
         return {};
     }
@@ -967,8 +977,17 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
             return miss(MissViews);
     }
     const auto* pipeline = t->pipeline;
-    if (!pipeline->IsReady() || (!pipeline->UsesPushDescriptors() && !NativeMaterial::SetsEnabled()))
+    if (!pipeline->IsReady() || (!pipeline->UsesPushDescriptors() && !NativeMaterial::SetsAt('0')))
         return miss(MissPipeline);
+    if (!pipeline->UsesPushDescriptors()) {
+        static const u32 sets_filter = [] {
+            const char* p = std::getenv("TLG_PASSES_SETS_FILTER");
+            return p ? u32(std::strtoul(p, nullptr, 0)) : 0u;
+        }();
+        if ((sets_filter & 1) && !pipeline->GetStage(Shader::SwStage::Vertex).samplers.empty())
+            return miss(MissPipeline);
+        if ((sets_filter & 2) && d.indirect) return miss(MissPipeline);
+    }
     // ISS_NATIVE_INDIRECT_CLASSES (default 3): the indexed indirect draws of these classes only
     // (1 opaque, 2 depth only, 4 blended). With the blended ones too the city lost its sunlight
     // and shadows in some frames (a3-indirect4, a3-cls7b 2026-10-18); 1 + 2 or 4 alone were right.
@@ -1166,6 +1185,9 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
     if (pipeline->UsesPushDescriptors()) {
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, pipeline->GetLayout(), 0, writes);
     } else if (!writes.empty()) {
+        if (NativeMaterial::LayoutCheckEnabled() &&
+            !NativeMaterial::WritesMatchLayout(*pipeline, writes.data(), u32(writes.size()), "passes"))
+            return fail(MissPool);
         const auto set = w->AllocateSet(pipeline->GetDescriptorSetLayout(), seq);
         if (!set) return fail(MissPool);
         for (auto& write : writes) write.dstSet = set;

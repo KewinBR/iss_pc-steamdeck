@@ -770,6 +770,7 @@ private:
     /// its buffer, and per 64 KB chunk the tick of the last GPU write recorded into it (0: never).
     static constexpr u32 UNIFIED_CHUNK_SHIFT = 16;
     bool EnableUnified();
+    bool EnableUnifiedDmaBuf(VAddr base, u64 size, int fd);
     std::pair<const Buffer*, u64> ObtainUnified(VAddr device_addr, u32 size, bool is_written,
                                                 bool* known_unwritten);
     VAddr unified_base{};

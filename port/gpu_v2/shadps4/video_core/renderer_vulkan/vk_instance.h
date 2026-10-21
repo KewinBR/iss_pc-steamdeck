@@ -479,6 +479,11 @@ public:
         return external_memory_host;
     }
 
+    /// steam-deck: VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf (heap unificado por dma-buf).
+    bool HasExternalMemoryDmaBuf() const {
+        return external_memory_dma_buf;
+    }
+
     /// Returns true when VK_EXT_device_fault is enabled.
     bool HasDeviceFault() const {
         return device_fault;
@@ -589,6 +594,7 @@ private:
     bool diagnostic_checkpoints{};
     bool device_fault{};
     bool external_memory_host{};
+    bool external_memory_dma_buf{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

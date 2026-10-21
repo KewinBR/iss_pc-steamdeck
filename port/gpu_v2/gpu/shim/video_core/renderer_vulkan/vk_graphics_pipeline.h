@@ -114,6 +114,12 @@ public:
         return *desc_layout;
     }
 
+    /// steam-deck: the bindings the set layout was created with (TLG_LAYOUT_CHECK).
+    const std::vector<vk::DescriptorSetLayoutBinding>& GetLayoutBindings() const noexcept {
+        return layout_bindings;
+    }
+    std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
+
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
     }

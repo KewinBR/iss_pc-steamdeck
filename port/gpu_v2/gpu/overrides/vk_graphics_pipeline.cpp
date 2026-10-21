@@ -633,6 +633,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         }
     }
     uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    layout_bindings.assign(bindings.begin(), bindings.end());
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};

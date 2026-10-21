@@ -3068,6 +3068,20 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
     }
+#ifdef TLG_RENDERER_V2
+    { // steam-deck (medição): mesma linha do renderer deste port, a cada 5 s
+        static auto window = now;
+        static unsigned frames = 0;
+        ++frames;
+        const float secs = std::chrono::duration<float>(now - window).count();
+        if (secs >= 5.0f) {
+            std::printf("Frame stats: %.1f FPS (renderer v2)\n", frames / secs);
+            std::fflush(stdout);
+            frames = 0;
+            window = now;
+        }
+    }
+#endif
     ConfirmRestart();
     // steam-deck: opened or closed from the pad thread (View button, RequestOpen).
     if (const int request = open_request.exchange(-1, std::memory_order_acq_rel); request >= 0) {

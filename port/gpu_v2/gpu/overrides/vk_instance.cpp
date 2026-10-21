@@ -250,7 +250,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -389,6 +389,9 @@ bool Instance::CreateDevice() {
     device_fault = fault_features.deviceFault && add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     // Only probed (BufferCache::ProbeHostImport): can the GPU use guest memory in place?
     external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // steam-deck: o heap unificado chega como dma-buf alocado pelo Vulkan (tlggpu_unified_alloc).
+    external_memory_dma_buf = add_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
+                              add_extension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 

@@ -1,3 +1,6 @@
+#include <unistd.h>
+#include <cstdint>
+extern "C" int iss_unified_dmabuf(uint64_t* size); // gpu_host.cpp (steam-deck)
 #include <atomic>
 #include "deep_profile.h"
 #include "repeat_census.h"
@@ -3831,6 +3834,15 @@ bool BufferCache::EnableUnified() {
             return fail("the arena already backs part of the range");
         }
     }
+    // steam-deck: heap que nasceu no Vulkan como dma-buf (tlggpu_unified_alloc): importa o dma-buf, que o RADV
+    // aceita, no lugar do ponteiro (o RADV só importa ponteiro de memória anônima).
+    {
+        u64 dmabuf_size = 0;
+        const int dmabuf = iss_unified_dmabuf(&dmabuf_size);
+        if (dmabuf >= 0 && dmabuf_size == size && instance.HasExternalMemoryDmaBuf()) {
+            return EnableUnifiedDmaBuf(base, size, dmabuf) || fail("dma-buf import");
+        }
+    }
     void* host = reinterpret_cast<void*>(span->physical_start);
     const auto device = instance.GetDevice();
     const auto properties =
@@ -3944,6 +3956,110 @@ bool BufferCache::EnableUnified() {
                  "UNIFIED_MEMORY on: guest 0x%llx size 0x%llx host %p memory type %u (bits 0x%x)\n",
                  (unsigned long long)base, (unsigned long long)size, host, type,
                  host_properties.memoryTypeBits);
+    return true;
+}
+
+bool BufferCache::EnableUnifiedDmaBuf(VAddr base, u64 size, int fd) {
+    const auto device = instance.GetDevice();
+    const vk::ExternalMemoryBufferCreateInfo external{
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT};
+    const vk::BufferCreateInfo buffer_ci{
+        .pNext = &external,
+        .size = size,
+        .usage = AllFlags,
+        .sharingMode = vk::SharingMode::eExclusive,
+    };
+    vk::Buffer handle{};
+    if (device.createBuffer(&buffer_ci, nullptr, &handle) != vk::Result::eSuccess) return false;
+    const auto requirements = device.getBufferMemoryRequirements(handle);
+    vk::MemoryFdPropertiesKHR fd_properties{};
+    if (device.getMemoryFdPropertiesKHR(vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, fd,
+                                        &fd_properties) != vk::Result::eSuccess) {
+        device.destroyBuffer(handle);
+        return false;
+    }
+    const auto& memory_properties = instance.GetMemoryProperties();
+    const u32 compatible = fd_properties.memoryTypeBits & requirements.memoryTypeBits;
+    u32 type = memory_properties.memoryTypeCount;
+    for (u32 i = 0; i < memory_properties.memoryTypeCount; ++i) {
+        const auto flags = memory_properties.memoryTypes[i].propertyFlags;
+        if ((compatible >> i & 1) && (flags & vk::MemoryPropertyFlagBits::eHostCoherent)) {
+            type = i;
+            break;
+        }
+    }
+    if (type == memory_properties.memoryTypeCount) {
+        device.destroyBuffer(handle);
+        return false;
+    }
+    // A importação fica com o descritor: um duplicado, o original segue com o runtime.
+    const int import_fd = dup(fd);
+    const vk::MemoryAllocateFlagsInfo allocate_flags{
+        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
+    const vk::ImportMemoryFdInfoKHR import_info{
+        .pNext = &allocate_flags,
+        .handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+        .fd = import_fd,
+    };
+    const vk::MemoryAllocateInfo alloc_info{
+        .pNext = &import_info,
+        .allocationSize = std::max<u64>(size, requirements.size),
+        .memoryTypeIndex = type,
+    };
+    if (import_fd < 0 || device.allocateMemory(&alloc_info, nullptr, &unified_memory) != vk::Result::eSuccess) {
+        if (import_fd >= 0) close(import_fd);
+        device.destroyBuffer(handle);
+        return false;
+    }
+    if (device.bindBufferMemory(handle, unified_memory, 0) != vk::Result::eSuccess) {
+        device.destroyBuffer(handle);
+        device.freeMemory(unified_memory);
+        unified_memory = vk::DeviceMemory{};
+        return false;
+    }
+    // A Buffer around the imported handle: created as a small sparse buffer (no memory), whose
+    // handle is replaced. Its destructor destroys the handle only.
+    unified_buffer = std::make_unique<Buffer>(instance, base, 64_KB, MemoryType::Sparse,
+                                              "Unified guest heap");
+    unified_buffer->buffer.Destroy();
+    unified_buffer->buffer.buffer = handle;
+    unified_buffer->buffer.bda_addr = device.getBufferAddress(vk::BufferDeviceAddressInfo{
+        .buffer = handle});
+    unified_buffer->cpu_addr = base;
+    unified_buffer->size_bytes = size;
+    unified_buffer->mem_type = MemoryType::HostCached;
+    unified_buffer->is_coherent = true;
+    unified_chunk_tick.assign(size >> UNIFIED_CHUNK_SHIFT, 0);
+
+    // Shaders that read guest memory through device addresses: the heap's blocks resolve into
+    // the imported buffer, and are resident (never backed in the arena).
+    const u64 first_block = base >> block_shift;
+    const u64 last_block = (base + size - 1) >> block_shift;
+    const u64 num_blocks = last_block - first_block + 1;
+    const auto staging =
+        Staging().Request(num_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
+    auto* entries = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+    for (u64 i = 0; i < num_blocks; ++i) {
+        entries[i] = unified_buffer->buffer.bda_addr + (i << block_shift);
+    }
+    staging.Flush();
+    const vk::BufferCopy copy{
+        .srcOffset = staging.offset,
+        .dstOffset = first_block * sizeof(vk::DeviceAddress),
+        .size = num_blocks * sizeof(vk::DeviceAddress),
+    };
+    Rt().CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), std::span{&copy, 1});
+    {
+        std::scoped_lock lock{residency_mutex};
+        MarkResident(first_block, last_block);
+    }
+    arena_binding_generation.fetch_add(1, std::memory_order_release);
+    Rt().untracked_reads = unified_buffer.get();
+    unified_base = base;
+    unified_end = base + size;
+    std::fprintf(stderr, "UNIFIED_MEMORY on (dma-buf): guest 0x%llx size 0x%llx memory type %u (bits 0x%x) gpu 0x%llx\n",
+                 (unsigned long long)base, (unsigned long long)size, type, fd_properties.memoryTypeBits,
+                 (unsigned long long)unified_buffer->buffer.bda_addr);
     return true;
 }
 

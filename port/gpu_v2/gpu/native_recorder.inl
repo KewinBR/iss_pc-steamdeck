@@ -145,12 +145,17 @@ struct Worker {
             };
             vk::DescriptorSet set{};
             if (device.allocateDescriptorSets(&info, &set) == vk::Result::eSuccess) {
-                current_last_user = seq;
+                // steam-deck: the latest user, not the last caller. A thread can take sets for an
+                // older segment after a newer one; with "= seq" the pool was reset when the older
+                // one retired, under the newer one still on the GPU (SQC faults in the RADV 32 bit
+                // range with ISS_NATIVE_GBUFFER_SETS=1).
+                current_last_user = std::max(current_last_user, seq);
                 return set;
             }
             // Full (or fragmented): retired until its users are released.
             full_pools.push_back({current_pool, current_last_user});
             current_pool = vk::DescriptorPool{};
+            current_last_user = 0;
         }
         return {};
     }
@@ -173,7 +178,12 @@ struct Worker {
             r->templates.clear();
             r->arena_reads.clear();
             spare.push_back(r);
-            while (!full_pools.empty() && full_pools.front().last_user <= r->seq) {
+            // steam-deck: TLG_POOL_NO_RESET=1 (diagnostico) nunca recicla um pool cheio.
+            static const bool no_reset = [] {
+                const char* p = std::getenv("TLG_POOL_NO_RESET");
+                return p && p[0] == 1;
+            }();
+            while (!no_reset && !full_pools.empty() && full_pools.front().last_user <= r->seq) {
                 device.resetDescriptorPool(full_pools.front().pool);
                 free_pools.push_back(full_pools.front().pool);
                 full_pools.pop_front();
@@ -527,7 +537,7 @@ static ng::Recording* RecordBatch(const ng::Batch& b, const ng::RangeStart& star
         }
         const auto* pipeline = t->pipeline;
         if (!pipeline->IsReady() ||
-            (!pipeline->UsesPushDescriptors() && !NativeMaterial::SetsEnabled()))
+            (!pipeline->UsesPushDescriptors() && !NativeMaterial::SetsAt('1')))
             return fail(MissPipeline);
 
         NR_STEP("template");
@@ -610,6 +620,10 @@ static ng::Recording* RecordBatch(const ng::Batch& b, const ng::RangeStart& star
             cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, pipeline->GetLayout(), 0,
                                      writes);
         } else if (!writes.empty()) {
+            if (NativeMaterial::LayoutCheckEnabled() &&
+                !NativeMaterial::WritesMatchLayout(*pipeline, writes.data(), u32(writes.size()),
+                                                   "recorder"))
+                return fail(MissPool);
             const auto set = w->AllocateSet(pipeline->GetDescriptorSetLayout(), rec->seq);
             if (!set) return fail(MissPool);
             for (auto& write : writes) write.dstSet = set;

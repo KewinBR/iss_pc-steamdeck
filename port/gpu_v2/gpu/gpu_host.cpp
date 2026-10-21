@@ -12,6 +12,8 @@
 #include <imgui.h>
 #include <SDL3/SDL.h>
 #include "iss_gpu.h"
+#include <dlfcn.h>
+#include <unistd.h>
 #include "tlggpu.h"
 #include "common/types.h"
 #include "core/memory.h"
@@ -245,3 +247,90 @@ void LoadFonts(ImGuiIO&) {}
 bool OnEvent(const SDL_Event&) { return false; }
 } // namespace iss::save_ui
 
+
+
+// steam-deck: TLG_UNIFIED_DMABUF. O RADV só importa ponteiro de memória anônima (userptr), e a memória do jogo é um
+// memfd compartilhado (duas visões): no Deck o heap unificado nunca ligava. Aqui o heap nasce no Vulkan: um
+// dispositivo temporário aloca a memória (host visível, coerente e com cache), exporta como dma-buf e é destruído (o
+// dma-buf segura a memória no kernel). O runtime mapeia o dma-buf nas duas visões no lugar do memfd, e o cache de
+// buffers do renderer importa o mesmo dma-buf (BufferCache::EnableUnifiedDmaBuf).
+namespace {
+std::atomic<int> g_unified_fd{-1};
+std::atomic<uint64_t> g_unified_size{0};
+} // namespace
+
+extern "C" int tlggpu_unified_alloc(uint64_t size) {
+    if (const int fd = g_unified_fd.load(); fd >= 0) return fd;
+    void* lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) return -1;
+    auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib, "vkGetInstanceProcAddr"));
+    if (!gipa) return -1;
+    auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(gipa(nullptr, "vkCreateInstance"));
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO, nullptr, "iss-unified", 1, "iss", 1,
+                          VK_API_VERSION_1_3};
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, nullptr, 0, &app};
+    VkInstance inst{};
+    if (!create_instance || create_instance(&ici, nullptr, &inst) != VK_SUCCESS) return -1;
+#define ISS_IP(name) auto p_##name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
+    ISS_IP(vkEnumeratePhysicalDevices);
+    ISS_IP(vkGetPhysicalDeviceMemoryProperties);
+    ISS_IP(vkCreateDevice);
+    ISS_IP(vkGetDeviceProcAddr);
+    ISS_IP(vkDestroyInstance);
+#undef ISS_IP
+    int fd = -1;
+    uint32_t count = 1;
+    VkPhysicalDevice pd{};
+    p_vkEnumeratePhysicalDevices(inst, &count, &pd);
+    VkDevice dev{};
+    if (count) {
+        float prio = 1.0f;
+        VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, 0, 1, &prio};
+        const char* exts[] = {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf"};
+        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, nullptr, 0, 1, &qci, 0, nullptr, 2, exts};
+        if (p_vkCreateDevice(pd, &dci, nullptr, &dev) != VK_SUCCESS) dev = VK_NULL_HANDLE;
+    }
+    if (dev) {
+        auto alloc = reinterpret_cast<PFN_vkAllocateMemory>(p_vkGetDeviceProcAddr(dev, "vkAllocateMemory"));
+        auto get_fd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(p_vkGetDeviceProcAddr(dev, "vkGetMemoryFdKHR"));
+        auto free_mem = reinterpret_cast<PFN_vkFreeMemory>(p_vkGetDeviceProcAddr(dev, "vkFreeMemory"));
+        auto destroy_dev = reinterpret_cast<PFN_vkDestroyDevice>(p_vkGetDeviceProcAddr(dev, "vkDestroyDevice"));
+        VkPhysicalDeviceMemoryProperties mp{};
+        p_vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                           VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        uint32_t type = mp.memoryTypeCount;
+        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+            if ((mp.memoryTypes[i].propertyFlags & want) == want &&
+                !(mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                type = i;
+                break;
+            }
+        if (type < mp.memoryTypeCount) {
+            VkExportMemoryAllocateInfo exp{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, nullptr,
+                                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exp, size, type};
+            VkDeviceMemory mem{};
+            if (alloc(dev, &ai, nullptr, &mem) == VK_SUCCESS) {
+                VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, nullptr, mem,
+                                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+                if (get_fd(dev, &gi, &fd) != VK_SUCCESS) fd = -1;
+                free_mem(dev, mem, nullptr);
+            }
+        }
+        destroy_dev(dev, nullptr);
+    }
+    p_vkDestroyInstance(inst, nullptr);
+    std::fprintf(stderr, "UNIFIED_DMABUF %s: %llu MB (fd %d)\n", fd >= 0 ? "alocado" : "falhou",
+                 (unsigned long long)(size >> 20), fd);
+    if (fd >= 0) {
+        g_unified_size.store(size);
+        g_unified_fd.store(fd);
+    }
+    return fd;
+}
+
+extern "C" int iss_unified_dmabuf(uint64_t* size) {
+    if (size) *size = g_unified_size.load();
+    return g_unified_fd.load();
+}
