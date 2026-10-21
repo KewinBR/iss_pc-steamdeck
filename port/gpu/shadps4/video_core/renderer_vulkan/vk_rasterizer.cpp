@@ -31,6 +31,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/region_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_depth_stencil_state.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -1096,6 +1097,97 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
             return;
         }
     }
+    // steam-deck (diagnóstico): TLG_DIAG_PAIR=<vs>:<ps> compara cada desenho desse par com o anterior do mesmo par
+    // (T#, S#, V# de cada estágio, dados de usuário, vértices) e imprime a cada 5 s quanto se repete: mostra o que
+    // um atalho de "desenho repetido" poderia reaproveitar (impostores do horizonte: 0beb7156:6353e48b).
+    static const std::pair<u64, u64> diag_pair = [] {
+        const char* e = std::getenv("TLG_DIAG_PAIR");
+        if (!e || !*e) {
+            return std::pair<u64, u64>{0, 0};
+        }
+        char* fim = nullptr;
+        const u64 vs = std::strtoull(e, &fim, 16);
+        return std::pair<u64, u64>{vs, fim && *fim == 0x3a ? std::strtoull(fim + 1, nullptr, 16) : 0};
+    }();
+    if (diag_pair.first && used_prepared) [[unlikely]] {
+        const auto& st = pipeline->GetStages();
+        const auto* vs = st[u32(Shader::SwStage::Vertex)];
+        const auto* ps = st[u32(Shader::SwStage::Fragment)];
+        if (vs && ps && vs->pgm_hash == diag_pair.first && ps->pgm_hash == diag_pair.second) {
+            struct Copia {
+                std::vector<u8> img, smp, buf, flat;
+                u64 vtx = 0;
+                u32 nbuf = 0;
+            };
+            static std::array<Copia, MaxShaderStages> ant{};
+            static bool tem_ant = false;
+            static u64 n = 0, mesmo_img = 0, mesmo_smp = 0, mesmo_buf = 0, mesmo_flat = 0, mesmo_vtx = 0,
+                       mesmo_tudo_menos_buf = 0;
+            static std::array<u64, 16> buf_muda{};
+            static auto janela = std::chrono::steady_clock::now();
+            bool img_ok = true, smp_ok = true, buf_ok = true, flat_ok = true;
+            const bool vtx_ok = tem_ant && used_prepared->vertex.valid &&
+                                used_prepared->vertex.buffers_hash == ant[0].vtx;
+            for (u32 i = 0; i < used_prepared->num_stages && i < MaxShaderStages; ++i) {
+                const auto& ps_ = used_prepared->stages[i];
+                Copia c;
+                c.img.assign(reinterpret_cast<const u8*>(ps_.image_sharps),
+                             reinterpret_cast<const u8*>(ps_.image_sharps + ps_.num_images));
+                c.smp.assign(reinterpret_cast<const u8*>(ps_.sampler_sharps),
+                             reinterpret_cast<const u8*>(ps_.sampler_sharps + ps_.num_samplers));
+                c.buf.assign(reinterpret_cast<const u8*>(ps_.buffer_sharps),
+                             reinterpret_cast<const u8*>(ps_.buffer_sharps + ps_.num_buffers));
+                c.flat.assign(reinterpret_cast<const u8*>(ps_.flat),
+                              reinterpret_cast<const u8*>(ps_.flat + ps_.flat_size));
+                c.nbuf = ps_.num_buffers;
+                if (tem_ant) {
+                    img_ok &= c.img == ant[i].img;
+                    smp_ok &= c.smp == ant[i].smp;
+                    flat_ok &= c.flat == ant[i].flat;
+                    if (c.buf != ant[i].buf) {
+                        buf_ok = false;
+                        for (u32 b = 0; b < c.nbuf && b < 16; ++b) {
+                            if (b >= ant[i].nbuf ||
+                                std::memcmp(c.buf.data() + b * sizeof(AmdGpu::Buffer),
+                                            ant[i].buf.data() + b * sizeof(AmdGpu::Buffer),
+                                            sizeof(AmdGpu::Buffer)) != 0) {
+                                ++buf_muda[b];
+                            }
+                        }
+                    }
+                }
+                ant[i] = std::move(c);
+            }
+            ant[0].vtx = used_prepared->vertex.buffers_hash;
+            if (tem_ant) {
+                ++n;
+                mesmo_img += img_ok;
+                mesmo_smp += smp_ok;
+                mesmo_buf += buf_ok;
+                mesmo_flat += flat_ok;
+                mesmo_vtx += vtx_ok;
+                mesmo_tudo_menos_buf += img_ok && smp_ok && vtx_ok;
+            }
+            tem_ant = true;
+            const auto agora = std::chrono::steady_clock::now();
+            if (agora - janela >= std::chrono::seconds(5) && n) {
+                janela = agora;
+                std::printf("Diag pair: %llu desenhos; iguais ao anterior: T# %.1f%%, S# %.1f%%, V# %.1f%%, "
+                            "dados %.1f%%, vertices %.1f%%, T#+S#+vertices %.1f%%; V# que mudam:",
+                            (unsigned long long)n, 100.0 * mesmo_img / n, 100.0 * mesmo_smp / n,
+                            100.0 * mesmo_buf / n, 100.0 * mesmo_flat / n, 100.0 * mesmo_vtx / n,
+                            100.0 * mesmo_tudo_menos_buf / n);
+                for (u32 b = 0; b < 16; ++b) {
+                    if (buf_muda[b]) {
+                        std::printf(" [%u] %.1f%%", b, 100.0 * buf_muda[b] / n);
+                    }
+                }
+                std::printf("\n");
+                n = mesmo_img = mesmo_smp = mesmo_buf = mesmo_flat = mesmo_vtx = mesmo_tudo_menos_buf = 0;
+                buf_muda = {};
+            }
+        }
+    }
     if (pipelined && FilterDrawPasses()) {
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
@@ -1287,7 +1379,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
-    pipeline->BindResources(set_writes, set_write_index, push_data);
+    pipeline->BindResources(set_writes, RepeatStillCurrent() ? 0u : set_write_index, push_data);
     // tlg: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -2238,6 +2330,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         return false;
     }
 
+    if (TryRepeatBind(pipeline)) {
+        return true;
+    }
+    repeat_hit_draw = false;
     set_write_index = 0;
     if (!SetWritePool()) {
         set_writes.clear();
@@ -2367,6 +2463,142 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         fault_process_pending = true;
     }
 
+    RememberBind(pipeline, uses_dma);
+    return true;
+}
+
+// steam-deck: T#, S# e V# preparados de todos os estágios, na ordem; com `out`, copia, senão compara com o memo.
+bool Rasterizer::SharpsMatch(const Pipeline* pipeline, std::vector<u8>* out) const {
+    size_t off = 0;
+    const auto& memo = bind_memo.sharps;
+    const auto part = [&](const void* data, size_t size) {
+        if (out) {
+            const auto* b = static_cast<const u8*>(data);
+            out->insert(out->end(), b, b + size);
+            return true;
+        }
+        if (off + size > memo.size() || std::memcmp(memo.data() + off, data, size) != 0) {
+            return false;
+        }
+        off += size;
+        return true;
+    };
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        const PreparedStage* p = FindPreparedStage(*stage);
+        if (!p || p->num_images != stage->images.size() || p->num_samplers != stage->samplers.size() ||
+            p->num_buffers != stage->buffers.size()) {
+            return false;
+        }
+        const u32 counts[3] = {p->num_images, p->num_samplers, p->num_buffers};
+        if (!part(counts, sizeof(counts)) || !part(p->image_sharps, p->num_images * sizeof(AmdGpu::Image)) ||
+            !part(p->sampler_sharps, p->num_samplers * sizeof(AmdGpu::Sampler)) ||
+            !part(p->buffer_sharps, p->num_buffers * sizeof(AmdGpu::Buffer))) {
+            return false;
+        }
+    }
+    return out || off == memo.size();
+}
+
+void Rasterizer::RememberBind(const Pipeline* pipeline, bool uses_dma) {
+    auto& m = bind_memo;
+    m.valid = false;
+    if (pipeline->IsCompute() || uses_dma || !bind_prepared) {
+        return;
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& image : stage->images) {
+            if (image.is_written) {
+                return;
+            }
+        }
+        for (const auto& buffer : stage->buffers) {
+            if (buffer.is_written) {
+                return;
+            }
+        }
+    }
+    m.sharps.clear();
+    if (!SharpsMatch(pipeline, &m.sharps)) {
+        return;
+    }
+    m.pipeline = pipeline;
+    m.dirty_epoch = VideoCore::g_dirty_epoch.load(std::memory_order_relaxed);
+    m.registry = texture_cache.RegistryGeneration();
+    m.tick = scheduler.CurrentTick();
+    m.lod_setting = TlgSettings::Get().mip_lod_bias.load();
+    m.scene_bias = upscaler->SceneMipBias();
+    m.proxies = scene_targets->Reduced();
+    m.set_write_index = set_write_index;
+    m.buf_offsets = push_data.buf_offsets;
+    m.bound_buffers.assign(bound_buffers.begin(), bound_buffers.end());
+    m.bound_images.clear();
+    for (const auto id : bound_images) {
+        m.bound_images.emplace_back(id, texture_cache.GetImage(id).binding);
+    }
+    m.valid = true;
+}
+
+bool Rasterizer::RepeatStillCurrent() const {
+    static const bool enabled = [] {
+        // Desligado por padrão: no Deck pular os descritores e os acessos de buffer deixou o quadro ~2% mais lento
+        // (31,5 contra 32,2 FPS, 2026-10-21), apesar de a thread de comandos ficar mais ociosa.
+        const char* e = std::getenv("TLG_REPEAT_PUSH");
+        return e && e[0] == '1';
+    }();
+    return enabled && repeat_hit_draw && bind_memo.valid && scheduler.CurrentTick() == bind_memo.tick;
+}
+
+bool Rasterizer::TryRepeatBind(const Pipeline* pipeline) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("TLG_REPEAT_BIND");
+        return !(e && e[0] == '0');
+    }();
+    auto& m = bind_memo;
+    const bool hit = enabled && m.valid && pipeline == m.pipeline && bind_prepared &&
+                     VideoCore::g_dirty_epoch.load(std::memory_order_relaxed) == m.dirty_epoch &&
+                     texture_cache.RegistryGeneration() == m.registry && scheduler.CurrentTick() == m.tick &&
+                     TlgSettings::Get().mip_lod_bias.load() == m.lod_setting &&
+                     upscaler->SceneMipBias() == m.scene_bias && scene_targets->Reduced() == m.proxies &&
+                     SharpsMatch(pipeline, nullptr);
+    static const bool stats = std::getenv("TLG_FRAME_STATS") != nullptr;
+    ++(hit ? repeat_hits : repeat_misses);
+    if (stats && ((repeat_hits + repeat_misses) & 1023) == 0) {
+        static auto window = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window >= std::chrono::seconds(5)) {
+            window = now;
+            std::printf("Repeat bind: %llu reused, %llu bound (%.1f%%)\n", (unsigned long long)repeat_hits,
+                        (unsigned long long)repeat_misses,
+                        100.0 * repeat_hits / std::max<u64>(1, repeat_hits + repeat_misses));
+            repeat_hits = repeat_misses = 0;
+        }
+    }
+    repeat_hit_draw = hit;
+    if (!hit) {
+        return false;
+    }
+    set_write_index = m.set_write_index;
+    push_data = MakeUserData(Regs());
+    push_data.buf_offsets = m.buf_offsets;
+    Shader::Backend::Bindings binding{};
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage) {
+            stage->PushUd(binding, push_data);
+        }
+    }
+    bound_buffers.assign(m.bound_buffers.begin(), m.bound_buffers.end());
+    bound_images.clear();
+    for (const auto& [id, image_binding] : m.bound_images) {
+        bound_images.push_back(id);
+        texture_cache.GetImage(id).binding = image_binding;
+    }
+    needs_barrier = false;
     return true;
 }
 
@@ -2588,6 +2820,17 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
+    // TLG_REPEAT_ACCESS=1 (desligado): os acessos de buffer do desenho que pegou o atalho não são registrados de
+    // novo. Separado do TLG_REPEAT_PUSH pra medir cada um.
+    static const bool skip_access = [] {
+        const char* e = std::getenv("TLG_REPEAT_ACCESS");
+        return e && e[0] == '1';
+    }();
+    if (!is_compute && skip_access && repeat_hit_draw && bind_memo.valid &&
+        scheduler.CurrentTick() == bind_memo.tick) {
+        bound_buffers.clear();
+    }
+    repeat_hit_draw = false;
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;

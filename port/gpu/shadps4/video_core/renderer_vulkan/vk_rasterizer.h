@@ -443,6 +443,29 @@ private:
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
+
+    /// steam-deck: TLG_REPEAT_BIND (ligado; 0 desliga). Um desenho com o mesmo pipeline e os mesmos T#, S# e V# do
+    /// anterior, sem memória marcada modificada, imagem registrada ou envio desde então, reaproveita os descritores
+    /// da amarração anterior; só as constantes empurradas são refeitas (impostores do horizonte: 95% dos desenhos).
+    struct BindMemo {
+        const Pipeline* pipeline = nullptr;
+        u64 dirty_epoch = 0, registry = 0, tick = 0;
+        float lod_setting = 0.0f, scene_bias = 0.0f;
+        bool proxies = false, valid = false;
+        u32 set_write_index = 0;
+        std::array<u8, Shader::NUM_BUFFERS> buf_offsets{};
+        std::vector<u8> sharps;
+        std::vector<BoundBuffer> bound_buffers;
+        std::vector<std::pair<VideoCore::ImageId, decltype(VideoCore::Image::binding)>> bound_images;
+    } bind_memo;
+    u64 repeat_hits = 0, repeat_misses = 0;
+    /// O desenho atual pegou o atalho: no mesmo envio (tick) do desenho anterior, os descritores empurrados e os
+    /// acessos de buffer registrados por ele continuam valendo (TLG_REPEAT_PUSH=1; desligado por padrão).
+    bool repeat_hit_draw = false;
+    bool RepeatStillCurrent() const;
+    bool TryRepeatBind(const Pipeline* pipeline);
+    void RememberBind(const Pipeline* pipeline, bool uses_dma);
+    bool SharpsMatch(const Pipeline* pipeline, std::vector<u8>* out) const;
     /// tlg (SetWritePool): room for `count` descriptor writes. The vector keeps its elements
     /// between draws, so growing it (which value-initialises them) happens once per high-water
     /// mark instead of per draw; with TLG_SET_WRITE_POOL=0 BindResources clears it each draw.

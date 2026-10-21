@@ -24,6 +24,10 @@
 #include "video_core/page_manager.h"
 
 namespace VideoCore {
+/// steam-deck: sobe cada vez que uma região vira modificada (CPU ou GPU); o atalho de amarração repetida do
+/// rasterizador (TLG_REPEAT_BIND) só reaproveita descritores enquanto ele não muda.
+inline std::atomic<u64> g_dirty_epoch{0};
+
 
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
 using LockType = Common::AdaptiveMutex;
@@ -102,6 +106,8 @@ public:
             NoteGpuBitsSet();
         }
         if constexpr (enable) {
+            // steam-deck: qualquer região marcada modificada invalida o atalho de amarração repetida
+            g_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
             bits.SetRange(start_page, end_page);
         } else {
             bits.UnsetRange(start_page, end_page);
