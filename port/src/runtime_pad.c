@@ -985,17 +985,17 @@ static void record_sample(const PadData *d) {
     /* steam-deck: TLG_PAD_RECORD_AUTO=1 starts the recording by itself at the first press or stick
      * movement (the Steam Deck has no F9 in Game Mode), once per session; it ends with the game. A replay
      * started at the same point of the same save repeats the route (measurements in heavy scenes). */
-    static int auto_checked, auto_on, auto_done;
+    static int auto_checked, auto_on, press_done;
     if (!auto_checked) {
         const char *e=getenv("TLG_PAD_RECORD_AUTO");
         auto_on=e && e[0]=='1';
         auto_checked=1;
     }
-    if (auto_on && !auto_done && !record_file) {
+    if (auto_on && !press_done && !record_file) {
         const int moved=d->buttons || abs((int)d->left_x-128)>40 || abs((int)d->left_y-128)>40 ||
                         abs((int)d->right_x-128)>40 || abs((int)d->right_y-128)>40 || d->l2>30 || d->r2>30;
         if (moved && (record_file=fopen(path,"w"))) {
-            auto_done=1;
+            press_done=1;
             record_start=now_us();
             memset(&record_last,0xff,sizeof(record_last));
             printf("Runtime: pad recording started at the first input (%s)\n",path);
