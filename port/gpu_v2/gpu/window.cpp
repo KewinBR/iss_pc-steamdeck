@@ -148,6 +148,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
 }
 
+// steam-deck: window focus for the pad (src/runtime_pad.c). In the Deck's Game Mode the Steam
+// menu and the quick access menu take the focus while they cover the game.
+static std::atomic<int> window_has_focus{1};
+extern "C" int tlggpu_window_focused(void) {
+    return window_has_focus.load(std::memory_order_relaxed);
+}
+
 // The game's mouse. Taken (relative mode) while the window has focus, the port's menu, text
 // box and save list are closed, and the player did not release it with Esc; a click in the
 // window takes it again. Returns true for events the game must not see.
@@ -155,9 +162,11 @@ bool WindowSDL::HandleMouse(const SDL_Event& event) {
     switch (event.type) {
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
         focused = true;
+        window_has_focus.store(1, std::memory_order_relaxed);
         return false;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         focused = mouse_test_start != 0; // the test runs unattended
+        window_has_focus.store(mouse_test_start != 0 ? 1 : 0, std::memory_order_relaxed);
         return false;
     case SDL_EVENT_KEY_DOWN:
         // Esc is free in the game's layout; the menu (open) and the text/save boxes take it first.

@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include "tlggpu.h"
 #include "common/types.h"
+#include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "sdl_window.h"
@@ -220,6 +221,12 @@ extern "C" void tlggpu_save_toast(int kind) {
     if (g_window) TlgOverlay::SaveToast(kind);
 }
 extern "C" int tlggpu_overlay_captures_input(void) { return TlgOverlay::CapturesInput() ? 1 : 0; }
+// steam-deck: the port's menu (opened by the pad, the game frozen behind it), as gpu/shim/tlggpu.cpp.
+extern "C" int tlggpu_overlay_menu_open(void) { return TlgOverlay::MenuOpen() ? 1 : 0; }
+extern "C" void tlggpu_overlay_request_open(int open) { TlgOverlay::RequestOpen(open != 0); }
+extern "C" void tlggpu_set_guest_paused(int paused) {
+    DebugState.guest_paused.store(paused != 0, std::memory_order_release);
+}
 extern "C" void tlggpu_overlay_notice(const char* text, float seconds) {
     TlgOverlay::Notice(text ? text : "", seconds);
 }

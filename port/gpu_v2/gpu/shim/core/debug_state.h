@@ -42,7 +42,10 @@ public:
     void CollectShader(const std::string&, Shader::SwStage, vk::ShaderModule, std::span<const u32>,
                        std::span<const u32>, std::span<const u32>, bool) {}
     void ShowDebugMessage(std::string) {}
-    bool IsGuestThreadsPaused() const { return false; }
+    // steam-deck: set while the port's menu freezes the game (tlggpu_set_guest_paused); the VideoOut loop
+    // then presents the last frame (with the menu) instead of taking flips. Pause/Resume stay no-ops.
+    std::atomic<bool> guest_paused{false};
+    bool IsGuestThreadsPaused() const { return guest_paused.load(std::memory_order_acquire); }
     void PauseGuestThreads() {}
     void ResumeGuestThreads() {}
 };
