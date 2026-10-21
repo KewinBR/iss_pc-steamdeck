@@ -19,6 +19,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 #include <SDL3/SDL.h>
 #include "mouse_stick.h"
 #include "mouse_touch.h"
@@ -230,7 +231,11 @@ static ButtonMap pad_map={{
     {SDL_GAMEPAD_BUTTON_TOUCHPAD,BTN_TOUCHPAD},
     {SDL_GAMEPAD_BUTTON_DPAD_UP,BTN_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN,BTN_DOWN},
     {SDL_GAMEPAD_BUTTON_DPAD_LEFT,BTN_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT,BTN_RIGHT},
-},15};
+    /* steam-deck: back buttons repeat the face buttons: L4 = A (cross), L5 = B (circle), R4 = X (square),
+     * R5 = Y (triangle). SDL: LEFT/RIGHT_PADDLE1 are L4/R4, LEFT/RIGHT_PADDLE2 are L5/R5. */
+    {SDL_GAMEPAD_BUTTON_LEFT_PADDLE1,BTN_CROSS}, {SDL_GAMEPAD_BUTTON_LEFT_PADDLE2,BTN_CIRCLE},
+    {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1,BTN_SQUARE}, {SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2,BTN_TRIANGLE},
+},19};
 static ButtonMap key_map={{
     {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_SQUARE},
     {SDL_SCANCODE_Q,BTN_TRIANGLE}, {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
@@ -398,7 +403,25 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
         motion.yaw=fminf(fmaxf(motion.yaw,-1.4f),1.4f);
         motion.aim_pitch=fminf(fmaxf(motion.aim_pitch,-1.2f),1.2f);
     }
-    if (g) {
+    /* steam-deck: the Deck has a real gyro, so the simulated "sensor mode" (sticks aim the spray can)
+     * is off unless TLG_SENSOR_MODE=1: L3+R3 stay L3/R3 and the "..." button (misc1 on the Deck) does
+     * not toggle it by accident. */
+    static int sensor_mode_allowed=-1;
+    if (sensor_mode_allowed<0) { const char *e=getenv("TLG_SENSOR_MODE"); sensor_mode_allowed=e && !strcmp(e,"1"); }
+    if (g && !sensor_mode_allowed) motion.mode=0;
+    /* steam-deck: L3+R3 juntos pedem o modo inspeção (vk_frame_capture.h): cria o TLG_INSPECT_TRIGGER. */
+    if (g && !sensor_mode_allowed) {
+        static int inspect_held=0;
+        const char *trigger=getenv("TLG_INSPECT_TRIGGER");
+        const int sticks=SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_LEFT_STICK) && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_RIGHT_STICK);
+        if (sticks && !inspect_held && trigger && *trigger) {
+            FILE *f=fopen(trigger,"w");
+            if (f) fclose(f);
+            printf("Runtime: inspect requested\n");
+        }
+        inspect_held=sticks;
+    }
+    if (g && sensor_mode_allowed) {
         const int sticks=SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_LEFT_STICK) && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_RIGHT_STICK);
         const int toggle=sticks || (motion_button()>=0 && SDL_GetGamepadButton(g,(SDL_GamepadButton)motion_button()));
         if (toggle && !motion.toggle_held) {
@@ -451,6 +474,37 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
             motion.q=quat_norm(quat_mul(motion.q,fix));
         }
         for (int i=0;i<3;++i) { d->acceleration[i]=a[i]; d->angular_velocity[i]=gyro[i]; }
+        /* steam-deck: chacoalhar o Deck (pra cima e pra baixo, deitado ou de lado) aciona a sacudida da lata.
+         * O Deck não chega no padrão que o jogo reconhece (~7 Hz, +-2,5 g no eixo da lata), então: a aceleração
+         * sem a gravidade estimada, suavizada em ~0,1 s; acima de 0,8 g por 0,3 s seguidos (o Kewin achou 0,45 g
+         * na hora sensível demais: assim dá a sensação de sacudir a lata um tempinho) a sacudida fabricada (a
+         * mesma do modo sensor) entra por cima do sensor de verdade e segue 0,25 s depois que o movimento para. O jogo só
+         * aceita a sacudida com a lata em pé (controle de lado): durante ela a pose enviada é a de lado (a da
+         * tecla T do modo sensor), sem mexer em motion.q; depois volta a inclinação de verdade.
+         * TLG_DECK_SHAKE=0 desliga. */
+        static int deck_shake=-1;
+        if (deck_shake<0) { const char *v=getenv("TLG_DECK_SHAKE"); deck_shake=!(v && v[0]=='0'); }
+        if (deck_shake && dt>0) {
+            static float level, held; static uint64_t until; static int logged;
+            const float dyn[3]={a[0]-e[0],a[1]-e[1],a[2]-e[2]};
+            const float m=sqrtf(dyn[0]*dyn[0]+dyn[1]*dyn[1]+dyn[2]*dyn[2]);
+            level+=(m-level)*(1.f-expf(-dt*10.f));
+            held=level>0.8f ? held+dt : fmaxf(0.f,held-2.f*dt);
+            if (level>0.8f && (held>0.3f || now<until)) {
+                until=now+250000u;
+                if (!logged) { logged=1; puts("Runtime: Deck shake detected (spray can shake)"); }
+            }
+            if (now<until) {
+                const Quat can={0.70710678f,0,0,-0.70710678f}; /* roll de 90 graus (lata em pé) */
+                float gs[3]; gravity_of(can,gs);
+                const float t=(float)(now%1000000u)*1e-6f, sn=sinf(t*6.2831853f*7.f), cs=cosf(t*6.2831853f*7.f);
+                for (int i=0;i<3;++i) d->acceleration[i]=gs[i]+2.5f*sn*gs[i];
+                const float side[3]={gs[1],-gs[0],0.f};
+                for (int i=0;i<3;++i) d->angular_velocity[i]=6.f*cs*side[i];
+                d->orientation[0]=can.x; d->orientation[1]=can.y; d->orientation[2]=can.z; d->orientation[3]=can.w;
+                return;
+            }
+        }
     } else {
         /* Ease toward the target so the game sees a turning motion, not a jump. */
         const float rate=dt>0 ? 1.f-expf(-dt*12.f) : 1.f;
@@ -485,10 +539,17 @@ static void sample_motion(PadData *d, SDL_Gamepad *g, const bool *k) {
  * Select/- (gamepad) or Tab (keyboard) and push the right stick (arrow keys): a finger moves
  * from the middle of the pad toward that side. A quick tap without moving still clicks. */
 static struct { int active; } swipe;
+/* steam-deck: View (Back) opens the port's menu with the game paused instead of clicking the touchpad
+ * (the Deck's trackpads already do that). TLG_VIEW_MENU=0 restores the touchpad click and swipe. */
+static int deck_view_menu(void) {
+    static int on=-1;
+    if (on<0) { const char *e=getenv("TLG_VIEW_MENU"); on=!(e && e[0]=='0'); }
+    return on;
+}
 static void apply_swipe(PadData *d, SDL_Gamepad *g, const bool *k) {
     float x=0, y=0;
     int held=0;
-    if (g && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_BACK)) {
+    if (g && !deck_view_menu() && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_BACK)) {
         held=1;
         x=(float)SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTX)/32767.f;
         y=(float)SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTY)/32767.f;
@@ -693,12 +754,60 @@ static void sample_host(PadData *d) {
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
     SDL_Gamepad *g=current_gamepad();
+    /* steam-deck: View with the menu closed freezes the game (every other guest thread waits in a signal, the
+     * VideoOut loop keeps showing the last frame) and opens the port's menu over it. This thread, the one
+     * reading the pad, waits here until the menu closes (View again, handled on the window thread; R3+L2;
+     * Esc), then everything resumes. A View press right after a close is ignored (the same press closed it). */
+    if (deck_view_menu()) {
+        static bool view_prev;
+        static uint64_t closed_at;
+        const bool view=g && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_BACK);
+        if (view && !view_prev && !tlggpu_overlay_menu_open() && now_us()>closed_at+400000) {
+            view_prev=true;
+            tlggpu_set_guest_paused(1);
+            runtime_pause_guest(1);
+            tlggpu_overlay_request_open(1);
+            for (int i=0;i<300 && !tlggpu_overlay_menu_open();++i) usleep(5000);
+            while (tlggpu_overlay_menu_open()) usleep(10000);
+            runtime_pause_guest(0);
+            tlggpu_set_guest_paused(0);
+            closed_at=now_us();
+            puts("Runtime: port menu closed, game resumed");
+            return;
+        }
+        view_prev=view;
+    }
     if (tlggpu_overlay_captures_input()) return; /* settings menu open: neutral input */
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     load_button_maps();
+    /* steam-deck: the Steam button pauses like the PS button on a PS4. Pressing it, or the Steam menu
+     * (or quick access menu) taking the window focus, taps the pause button (right touchpad half,
+     * the game's pause menu) once; while the menu covers the game the game gets neutral input, so
+     * navigating the Steam menu does not drive the pause menu. Back in the game it stays paused until
+     * a button is pressed; only then can the next Steam press pause again. */
+    {
+        static bool steam_prev, steam_paused, was_focused=true;
+        static uint64_t steam_tap_until;
+        const bool focused_now=tlggpu_window_focused()!=0;
+        const bool steam=g && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_GUIDE);
+        if (((steam && !steam_prev) || (was_focused && !focused_now)) && !steam_paused) {
+            steam_tap_until=now_us()+150000;
+            steam_paused=true;
+        }
+        steam_prev=steam;
+        was_focused=focused_now;
+        if (now_us()<steam_tap_until) { d->buttons=CLICK_RIGHT; return; }
+        if (!focused_now) return;
+        if (g && steam_paused) {
+            for (size_t i=0;i<pad_map.count;++i)
+                if (SDL_GetGamepadButton(g,(SDL_GamepadButton)pad_map.entries[i].source)) { steam_paused=false; break; }
+        }
+    }
     if (g) {
-        for (size_t i=0;i<pad_map.count;++i)
+        for (size_t i=0;i<pad_map.count;++i) {
+            if (deck_view_menu() && pad_map.entries[i].source==SDL_GAMEPAD_BUTTON_BACK) continue;
             if (SDL_GetGamepadButton(g,(SDL_GamepadButton)pad_map.entries[i].source)) d->buttons|=pad_map.entries[i].ps;
+        }
         const uint32_t mapped=d->buttons;
         d->left_x=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTX)); d->left_y=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTY));
         d->right_x=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTX)); d->right_y=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTY));
@@ -707,7 +816,29 @@ static void sample_host(PadData *d) {
         if (d->r2>30) d->buttons|=BTN_R2;
         if (mapped & BTN_L2) d->l2=255;
         if (mapped & BTN_R2) d->r2=255;
-        if (SDL_GetNumGamepadTouchpads(g)>0) {
+        const int touchpads=SDL_GetNumGamepadTouchpads(g);
+        if (touchpads>=2) {
+            /* steam-deck: Steam Deck, two trackpads with one finger each (SDL's HIDAPI driver reports a
+             * finger only while the pad is pressed, with its pressure). The left pad is the left half of
+             * the PS4 touchpad and the right pad the right half, so the game's left/right/two-finger
+             * checks work; a firm press (pressure over 0.12, released under 0.06, the thresholds used in
+             * shadPS4-plus) is the touchpad click, both pads pressed = two fingers. */
+            static int deck_click;
+            float firmest=0.0f;
+            for (int pad=0;pad<2 && d->touch_count<2;++pad) {
+                bool down=false;
+                float x=0, y=0, pressure=0;
+                if (SDL_GetGamepadTouchpadFinger(g,pad,0,&down,&x,&y,&pressure) && down) {
+                    const float half=pad==0 ? x*0.5f : 0.5f+x*0.5f;
+                    d->touches[d->touch_count++]=(PadTouch){.x=touch_axis(half,1919),
+                        .y=touch_axis(y,942),.id=(uint8_t)pad};
+                    if (pressure>firmest) firmest=pressure;
+                }
+            }
+            if (firmest>0.12f) deck_click=1;
+            else if (firmest<0.06f) deck_click=0;
+            if (deck_click && d->touch_count) d->buttons|=BTN_TOUCHPAD;
+        } else if (touchpads>0) {
             const int fingers=SDL_GetNumGamepadTouchpadFingers(g,0);
             for (int finger=0;finger<fingers && d->touch_count<2;++finger) {
                 bool down=false;
@@ -811,6 +942,25 @@ static void record_sample(const PadData *d) {
         }
     }
     f9_was_down=f9;
+    /* steam-deck: TLG_PAD_RECORD_AUTO=1 starts the recording by itself at the first press or stick
+     * movement (the Steam Deck has no F9 in Game Mode), once per session; it ends with the game. A replay
+     * started at the same point of the same save repeats the route (measurements in heavy scenes). */
+    static int auto_checked, auto_on, auto_done;
+    if (!auto_checked) {
+        const char *e=getenv("TLG_PAD_RECORD_AUTO");
+        auto_on=e && e[0]=='1';
+        auto_checked=1;
+    }
+    if (auto_on && !auto_done && !record_file) {
+        const int moved=d->buttons || abs((int)d->left_x-128)>40 || abs((int)d->left_y-128)>40 ||
+                        abs((int)d->right_x-128)>40 || abs((int)d->right_y-128)>40 || d->l2>30 || d->r2>30;
+        if (moved && (record_file=fopen(path,"w"))) {
+            auto_done=1;
+            record_start=now_us();
+            memset(&record_last,0xff,sizeof(record_last));
+            printf("Runtime: pad recording started at the first input (%s)\n",path);
+        }
+    }
     if (!record_file) return;
     PadSample s={(uint32_t)((now_us()-record_start)/1000),d->buttons,
                  {d->left_x,d->left_y,d->right_x,d->right_y},d->l2,d->r2};

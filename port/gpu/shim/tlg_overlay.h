@@ -47,6 +47,10 @@ void Notice(const std::string& text, float seconds);
 /// The menu is open or a text entry is shown: the game's input is held neutral.
 bool CapturesInput();
 
+/// steam-deck: the settings menu is open; RequestOpen opens/closes it on the next present (any thread).
+bool MenuOpen();
+void RequestOpen(bool open);
+
 /// Window thread: the game's text dialog (sceImeDialog). Shown as a box on screen until
 /// `active` is false; typing goes to the window (sdl_window), the box only displays it.
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text);

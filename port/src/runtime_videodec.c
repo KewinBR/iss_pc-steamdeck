@@ -88,6 +88,24 @@ static ABI int32_t videodec_create(const ConfigInfo *config, const ResourceInfo 
     return 0;
 }
 
+/* steam-deck: full-screen movies (art/movies/cutscene: the Sucker Punch intro, cutscenes) in 16:10. With the
+ * game's virtual screen at 16:10 (TLG_VIDEO_CROP_1610=1, set by the launch script for the 16:10 resolutions)
+ * a 16:9 picture is handed over cropped at the centre to 16:10 (1920x1080 -> 1728x1080: 96 px off each side);
+ * the game fits it to the screen, so it fills it with no bars and no stretching. Every movie is cropped (power
+ * previews and in-game TVs too: the Kewin chose immersion); movie_path is kept for the log. */
+static char movie_path[256];
+void runtime_videodec_note_open(const char *guest) {
+    const size_t n=guest ? strlen(guest) : 0;
+    if (n>4 && !strcmp(guest+n-4,".bsf")) {
+        snprintf(movie_path,sizeof(movie_path),"%s",guest);
+    }
+}
+static int crop_1610(void) {
+    static int on=-1;
+    if (on<0) { const char *e=getenv("TLG_VIDEO_CROP_1610"); on=e && e[0]=='1'; }
+    return on; /* todos os vídeos (pedido do Kewin: mais imersão), não só os de tela cheia */
+}
+
 /* The decoded picture into the game's buffer: luma, then interleaved chroma, both with a pitch
  * of the width aligned to 64 and the height aligned to 16 (the last rows repeated). */
 static int32_t picture(Decoder *d, FrameBuffer *buffer, PictureInfo *info) {
@@ -102,16 +120,23 @@ static int32_t picture(Decoder *d, FrameBuffer *buffer, PictureInfo *info) {
             return ERR_API_FAIL;
         f=d->nv12;
     }
-    uint32_t width=(uint32_t)f->width, height=(uint32_t)f->height;
+    uint32_t width=(uint32_t)f->width, height=(uint32_t)f->height, x0=0;
+    if (crop_1610() && (uint64_t)width*10>(uint64_t)height*16) {
+        const uint32_t cw=(height*16/10)&~1u;
+        x0=((width-cw)/2)&~1u; /* par: no NV12 o deslocamento em bytes vale pro croma também */
+        width=cw;
+        static int logged;
+        if (!logged) { logged=1; printf("Videodec: full-screen movie cropped to 16:10 (%ux%u, %s)\n",width,height,movie_path); }
+    }
     uint32_t pitch=align(width,64), rows=align(height,16);
     if ((uint64_t)pitch*rows*3/2>buffer->frame_buffer_size) return ERR_FRAME_BUFFER_SIZE;
     unsigned char *luma=buffer->frame_buffer, *chroma=luma+(size_t)pitch*rows;
     for (uint32_t y=0;y<rows;++y) {
         uint32_t from=y<height ? y : height-1;
-        memcpy(luma+(size_t)y*pitch,f->data[0]+(size_t)from*(size_t)f->linesize[0],width);
+        memcpy(luma+(size_t)y*pitch,f->data[0]+(size_t)from*(size_t)f->linesize[0]+x0,width);
         if (y<rows/2) {
             uint32_t c=y<height/2 ? y : height/2-1;
-            memcpy(chroma+(size_t)y*pitch,f->data[1]+(size_t)c*(size_t)f->linesize[1],width);
+            memcpy(chroma+(size_t)y*pitch,f->data[1]+(size_t)c*(size_t)f->linesize[1]+x0,width);
         }
     }
     info->is_valid=1; info->codec_type=0;

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/vk_common.h"
 
 namespace VideoCore {
 struct ImageInfo;
@@ -62,6 +63,38 @@ private:
     static inline std::atomic<u64> flips{0};
     static inline std::atomic<VAddr> last_presented{0};
     static inline std::atomic<bool> requested{false};
+};
+
+/// steam-deck: modo inspeção, identifica o objeto no centro da tela. Criar o arquivo TLG_INSPECT_TRIGGER (o
+/// rodar-iss.sh usa /tmp/iss-inspecionar; L3+R3 juntos no controle criam ele) grava o próximo quadro como a captura
+/// acima e põe em cada desenho uma consulta de oclusão limitada ao pixel do centro do alvo. O último desenho com cor
+/// e profundidade que escreveu ali é o objeto mirado: o código dele (M-xxxx, dos índices e shaders) aparece na tela e
+/// vai pro log e pra <captures>/inspecao_<data>.txt, com tudo o que passou pelo centro (endereço dos índices,
+/// contagem, shaders, passe da captura do mesmo quadro). Só desenhos diretos (os indiretos não entram).
+class Inspect {
+public:
+    struct DrawInfo {
+        u64 vs{}, ps{};
+        VAddr indices{}; ///< endereço do primeiro índice (0 se não indexado)
+        u32 num_indices{}, instances{}, first_vertex{}, first_instance{};
+        bool depth_write{}, color{};
+        VAddr color0{};
+        u16 width{}, height{};
+    };
+    /// GPU thread: se o quadro gravado é de inspeção.
+    static bool Active() {
+        return active.load(std::memory_order_relaxed);
+    }
+    /// GPU thread: registra o desenho; índice da consulta ou ~0u (sem espaço).
+    static u32 Begin(vk::Device device, const DrawInfo& info);
+    static vk::QueryPool Pool() {
+        return pool;
+    }
+
+private:
+    friend class FrameCapture;
+    static inline std::atomic<bool> active{false};
+    static inline vk::QueryPool pool{};
 };
 
 } // namespace Vulkan

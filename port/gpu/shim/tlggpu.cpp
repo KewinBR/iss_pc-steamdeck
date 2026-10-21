@@ -2,6 +2,7 @@
 #include "tlg_write_log.h"
 // tlg: glue between the C loader and the vendored shadPS4 video core.
 #include "tlg_overlay.h"
+#include "core/debug_state.h"
 #include "tlg_png.h"
 #include "tlg_settings.h"
 #include <cstdlib>
@@ -484,6 +485,18 @@ extern "C" void tlggpu_overlay_notice(const char* text, float seconds) {
 
 extern "C" int tlggpu_overlay_captures_input(void) {
     return TlgOverlay::CapturesInput() ? 1 : 0;
+}
+
+extern "C" int tlggpu_overlay_menu_open(void) {
+    return TlgOverlay::MenuOpen() ? 1 : 0;
+}
+
+extern "C" void tlggpu_overlay_request_open(int open) {
+    TlgOverlay::RequestOpen(open != 0);
+}
+
+extern "C" void tlggpu_set_guest_paused(int paused) {
+    DebugState.guest_paused.store(paused != 0, std::memory_order_release);
 }
 
 extern "C" void tlggpu_input_settings(TlgGpuInputSettings* out) {

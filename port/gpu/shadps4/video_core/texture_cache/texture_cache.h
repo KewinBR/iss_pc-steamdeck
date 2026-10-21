@@ -249,6 +249,10 @@ public:
     /// tlg: TLG_BC_TINY: fills an is_bc_decoded image from a CPU decode of guest memory.
     void UploadDecodedImage(Image& image);
 
+    /// steam-deck: TLG_TEXTURE_REPLACE_DIR: uploads a replacement (.tlgtex) instead of the guest
+    /// texture when the guest bytes hash to one the replacement names. True when it did.
+    bool ReplaceImage(Image& image);
+
     /// Retrieves the sampler that matches the provided S# descriptor.
     /// extra_lod_bias: tlg, added to the S#'s bias (reduced scene rendering).
     /// lru_id: tlg, receives the sampler's LRU entry for TouchSamplers (SamplerSetMemo).

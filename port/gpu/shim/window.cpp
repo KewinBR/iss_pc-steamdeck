@@ -1,3 +1,4 @@
+#include <atomic>
 // tlg: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <algorithm>
 #include <cstdio>
@@ -22,6 +23,13 @@ u32 MouseBit(u8 button) {
     return button >= 1 && button <= 32 ? 1u << (button - 1) : 0;
 }
 } // namespace
+
+// steam-deck: window focus for the pad (src/runtime_pad.c). In the Deck's Game Mode the Steam
+// menu and the quick access menu take the focus while they cover the game.
+static std::atomic<int> window_has_focus{1};
+extern "C" int tlggpu_window_focused(void) {
+    return window_has_focus.load(std::memory_order_relaxed);
+}
 
 extern "C" void tlggpu_mouse_take(TlgGpuMouse* out) {
     std::scoped_lock lock{mouse_mutex};
@@ -130,9 +138,13 @@ bool WindowSDL::HandleMouse(const SDL_Event& event) {
     switch (event.type) {
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
         focused = true;
+        window_has_focus.store(1, std::memory_order_relaxed);
+        LOG_INFO(Frontend, "Window focus gained");
         return false;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
         focused = mouse_test_start != 0; // the test runs unattended
+        window_has_focus.store(mouse_test_start != 0 ? 1 : 0, std::memory_order_relaxed);
+        LOG_INFO(Frontend, "Window focus lost");
         return false;
     case SDL_EVENT_KEY_DOWN:
         // Esc is free in the game's layout; the menu (open) and the text/save boxes take it first.

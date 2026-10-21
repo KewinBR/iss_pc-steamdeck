@@ -62,6 +62,14 @@ void tlggpu_graffiti_guide(int force);
 void tlggpu_save_toast(int kind);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int tlggpu_overlay_captures_input(void);
+/* steam-deck: 1 while the port's settings menu itself is open (not dialogs). */
+int tlggpu_overlay_menu_open(void);
+/* steam-deck: asks the present thread to open (1) or close (0) the settings menu (any thread). */
+void tlggpu_overlay_request_open(int open);
+/* steam-deck: 1 while the game's threads are frozen (the VideoOut loop keeps showing the last frame). */
+void tlggpu_set_guest_paused(int paused);
+/* steam-deck: 1 while the game window has the input focus (the Steam menu takes it in Game Mode). */
+int tlggpu_window_focused(void);
 /* A short message at the top of the screen (any thread). */
 void tlggpu_overlay_notice(const char *text, float seconds);
 /* Guest memcpy (src) / memset (src NULL, fill) into GPU-modified memory without a fault or a

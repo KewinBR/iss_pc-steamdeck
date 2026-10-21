@@ -15,6 +15,7 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <errno.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 #ifdef _WIN32
@@ -70,6 +71,44 @@ static uint64_t tls_filesz, tls_memsz, tls_align=16;
 static size_t created, joined_count, exited;
 static int wait_stats(void);        /* TLG_WAIT_STATS: per-thread wait accounting, further down */
 static void wait_stats_start(void); /* its monitor thread, started with the main thread */
+
+#ifndef _WIN32
+/* steam-deck: freeze of the game while the port's menu is open (View on the Deck). Each guest thread gets
+ * SIGRTMIN+3 and sleeps inside the handler until the pause ends; the caller (the thread reading the pad)
+ * waits on its own. */
+static volatile sig_atomic_t guest_paused;
+static void pause_handler(int sig) {
+    (void)sig;
+    const int saved=errno;
+    const struct timespec nap={0,5000000};
+    while (guest_paused) nanosleep(&nap,NULL);
+    errno=saved;
+}
+void runtime_pause_guest(int pause) {
+    static int installed;
+    if (!installed) {
+        struct sigaction sa;
+        memset(&sa,0,sizeof(sa));
+        sa.sa_handler=pause_handler;
+        sa.sa_flags=SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGRTMIN+3,&sa,NULL);
+        installed=1;
+    }
+    if (!pause) { guest_paused=0; return; }
+    if (guest_paused) return;
+    guest_paused=1;
+    const pid_t self=gettid();
+    int n=0;
+    pthread_mutex_lock(&lock);
+    for (GuestThread *t=threads;t;t=t->next)
+        if (!t->finished && t->os_tid && (pid_t)t->os_tid!=self) { syscall(SYS_tgkill,getpid(),(pid_t)t->os_tid,SIGRTMIN+3); ++n; }
+    pthread_mutex_unlock(&lock);
+    printf("Runtime: game frozen (%d threads) for the port menu\n",n);
+}
+#else
+void runtime_pause_guest(int pause) { (void)pause; }
+#endif
 
 void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64_t align) {
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;

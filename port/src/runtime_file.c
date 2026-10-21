@@ -263,6 +263,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     pthread_mutex_init(&files[fd].io,NULL);
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     tlggpu_note_open(guest); /* region trace (TLG_REGION_TRACE=1) */
+    runtime_videodec_note_open(guest); /* steam-deck: 16:10 crop of full-screen movies */
     ++opens;
     pthread_mutex_unlock(&lock);
     if (runtime_verbose()) {

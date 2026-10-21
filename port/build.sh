@@ -84,7 +84,8 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
     fi
 done
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTLG_PGO="$pgo" \
-    -DTLG_LTO="${TLG_LTO:-ON}" -DTLG_PGO_DIR="$PWD/pgo" >/dev/null
+    -DTLG_LTO="${TLG_LTO:-ON}" -DTLG_PGO_DIR="$PWD/pgo" \
+    -DCMAKE_SHARED_LINKER_FLAGS="${TLG_EXTRA_LDFLAGS:-}" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${TLG_LTO:-ON}"
 # A failed GPU build must stop here: an older libtlggpu.so would otherwise be used silently.
 if ! ninja -C out/gpu tlggpu > out/gpu-build.log 2>&1; then

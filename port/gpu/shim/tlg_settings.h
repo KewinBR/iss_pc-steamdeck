@@ -138,6 +138,19 @@ struct Values {
 
     // Draw distance (tlg_view.h, src/view_hook.h; inFAMOUS 1.07 only, view_supported). Live:
     // the LOD values on the next frame, the clip planes for cameras the game creates afterwards.
+    /// steam-deck: particle density (0 original, 1 medium, 2 low). Not used by the runtime: the Deck's
+    /// launch script reads it from tlg.ini and builds the game patches (emitter budget, PARTICLE_COUNT_RATIO)
+    /// before the next start.
+    std::atomic<int> particles{0};
+    /// steam-deck: game patches chosen in the Graphics tab, applied by the Deck's launch script on the next
+    /// start (tlg.ini keys gfx_*). preset: 0 high, 1 medium, 2 low, 3 custom. resolution: 0 1080p, 1 900p,
+    /// 2 720p, 3 540p. distance / shadows: 0 high, 1 medium, 2 low. particles above uses the same 0-2 scale.
+    std::atomic<int> gfx_preset{3}, gfx_resolution{2}, gfx_distance{2}, gfx_shadows{1};
+    /// steam-deck: campo de visão, índice em 100/95/90/85/80% (gfx_fov no tlg.ini).
+    std::atomic<int> gfx_fov{0};
+    /// steam-deck: tamanho da legenda, índice em 36/42/48/54 (gfx_subtitles no tlg.ini; 36 é o do jogo).
+    std::atomic<int> gfx_subtitles{2};
+    std::atomic<bool> gfx_motion_blur{false}, gfx_ssr{false}, gfx_unlock_fps{true};
     std::atomic<float> lod_scale{1.0f}, region_lod{1.0f}, region_fade{1.0f};
     std::atomic<float> near_clip{10.0f}, far_clip{1.0e7f};
     std::atomic<float> lod_bands[6]{400.0f, 750.0f, 1500.0f, 3500.0f, 6000.0f, 15000.0f};

@@ -1068,6 +1068,25 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
             return;
         }
     }
+    // steam-deck (diagnóstico): TLG_SKIP_PAIR=<vs>:<ps> (hashes em hex como na captura de quadro) descarta os
+    // desenhos desse par, pra medir quanto ele pesa (ex.: os impostores do horizonte, 0beb7156:6353e48b).
+    static const std::pair<u64, u64> skip_pair = [] {
+        const char* e = std::getenv("TLG_SKIP_PAIR");
+        if (!e || !*e) {
+            return std::pair<u64, u64>{0, 0};
+        }
+        char* fim = nullptr;
+        const u64 vs = std::strtoull(e, &fim, 16);
+        return std::pair<u64, u64>{vs, fim && *fim == 0x3a ? std::strtoull(fim + 1, nullptr, 16) : 0};
+    }();
+    if (skip_pair.first) [[unlikely]] {
+        const auto& st = pipeline->GetStages();
+        const auto* vs = st[u32(Shader::SwStage::Vertex)];
+        const auto* ps = st[u32(Shader::SwStage::Fragment)];
+        if (vs && ps && vs->pgm_hash == skip_pair.first && ps->pgm_hash == skip_pair.second) {
+            return;
+        }
+    }
     if (pipelined && FilterDrawPasses()) {
         PostDraw(pipeline, used_prepared, is_indexed, index_offset);
         return;
@@ -1284,6 +1303,43 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
+    // steam-deck: modo inspeção (vk_frame_capture.h). O desenho vai com uma consulta de oclusão e o recorte
+    // reduzido ao pixel do centro do alvo (só se o recorte do jogo já cobre o centro); o estado dinâmico é
+    // reemitido no desenho seguinte.
+    u32 inspect_query = ~0u;
+    vk::Rect2D inspect_pixel{};
+    if (Inspect::Active() && FrameCapture::IsRecording()) [[unlikely]] {
+        const auto& current = scheduler.GetDynamicState().scissors;
+        const s32 cx = state.width / 2, cy = state.height / 2;
+        bool inside = !current.empty();
+        if (inside) {
+            const auto& r = current[0];
+            inside = cx >= r.offset.x && cy >= r.offset.y && cx < r.offset.x + s32(r.extent.width) &&
+                     cy < r.offset.y + s32(r.extent.height);
+        }
+        if (inside) {
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            const u32 index_size =
+                regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+            inspect_query = Inspect::Begin(
+                instance.GetDevice(),
+                {.vs = vs_info.pgm_hash,
+                 .ps = ps ? ps->pgm_hash : 0,
+                 .indices = is_indexed ? regs.index_base_address.Address<VAddr>() +
+                                             u64(index_offset) * index_size
+                                       : 0,
+                 .num_indices = num_indices,
+                 .instances = num_instances,
+                 .first_vertex = first_vertex,
+                 .first_instance = first_instance,
+                 .depth_write = regs.depth_control.depth_enable && regs.depth_control.depth_write_enable,
+                 .color = state.num_color_attachments > 0,
+                 .color0 = regs.color_buffers[0] ? VAddr(regs.color_buffers[0].Address()) : 0,
+                 .width = state.width,
+                 .height = state.height});
+            inspect_pixel = vk::Rect2D{{cx, cy}, {1, 1}};
+        }
+    }
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         const auto draw = [&] {
             if (is_indexed) {
@@ -1294,7 +1350,14 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             }
         };
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
-        draw();
+        if (inspect_query != ~0u) [[unlikely]] {
+            cmdbuf.setScissorWithCount(inspect_pixel);
+            cmdbuf.beginQuery(Inspect::Pool(), inspect_query, {});
+            draw();
+            cmdbuf.endQuery(Inspect::Pool(), inspect_query);
+        } else {
+            draw();
+        }
         if (square) [[unlikely]] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, square);
             draw();
@@ -1314,6 +1377,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
     }
     DebugState.IncDrawCall();
+    if (inspect_query != ~0u) [[unlikely]] {
+        scheduler.GetDynamicState().Invalidate();
+    }
 
     ResetBindings(false);
     scheduler.KickRecording();

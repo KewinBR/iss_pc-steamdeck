@@ -179,6 +179,26 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.blue_orb_multiplier = TlgOrbs::ClampMultiplier(f);
     } else if (key == "gold_orb_multiplier") {
         v.gold_orb_multiplier = TlgOrbs::ClampMultiplier(f);
+    } else if (key == "gfx_preset") {
+        v.gfx_preset = std::clamp(i, 0, 3);
+    } else if (key == "gfx_resolution") {
+        v.gfx_resolution = std::clamp(i, 0, 4);
+    } else if (key == "gfx_fov") {
+        v.gfx_fov = std::clamp(i, 0, 4);
+    } else if (key == "gfx_subtitles") {
+        v.gfx_subtitles = std::clamp(i, 0, 3);
+    } else if (key == "gfx_distance") {
+        v.gfx_distance = std::clamp(i, 0, 2);
+    } else if (key == "gfx_shadows") {
+        v.gfx_shadows = std::clamp(i, 0, 2);
+    } else if (key == "gfx_motion_blur") {
+        v.gfx_motion_blur = i != 0;
+    } else if (key == "gfx_ssr") {
+        v.gfx_ssr = i != 0;
+    } else if (key == "gfx_unlock_fps") {
+        v.gfx_unlock_fps = i != 0;
+    } else if (key == "particles") {
+        v.particles = std::clamp(i, 0, 2);
     } else if (key == "lod_scale") {
         v.lod_scale = TlgView::ClampLodScale(f);
     } else if (key == "region_lod") {
@@ -377,6 +397,12 @@ void Save() {
                  TlgGraphics::Resolutions[std::clamp(v.render_resolution.load(), 0, 5)].data(),
                  v.engine_fps.load(), int(v.deferred_readback.load()), int(v.stale_readback.load()),
                  int(v.restart_unconfirmed.load()));
+    std::fprintf(file, "particles=%d\n", v.particles.load());
+    std::fprintf(file, "gfx_preset=%d\ngfx_resolution=%d\ngfx_distance=%d\ngfx_shadows=%d\n"
+                       "gfx_motion_blur=%d\ngfx_ssr=%d\ngfx_unlock_fps=%d\ngfx_fov=%d\ngfx_subtitles=%d\n",
+                 v.gfx_preset.load(), v.gfx_resolution.load(), v.gfx_distance.load(), v.gfx_shadows.load(),
+                 int(v.gfx_motion_blur.load()), int(v.gfx_ssr.load()), int(v.gfx_unlock_fps.load()),
+                 v.gfx_fov.load(), v.gfx_subtitles.load());
     std::fprintf(file, "sensor_aim=%d\ngraffiti_guide_seen=%d\n", v.sensor_aim.load(),
                  int(v.graffiti_guide_seen.load()));
     std::fprintf(file,

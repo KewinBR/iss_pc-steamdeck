@@ -31,6 +31,7 @@
 
 typedef struct {
     int used, type, channels, is_float, frames, sample_bytes, std_layout, downmix;
+    int pad_side; /* steam-deck: pad speaker port played on one side (1 left, 2 right), 0 both */
     int32_t volume[8];
     SDL_AudioStream *stream;
     uint64_t next_deadline_ns; /* next return of sceAudioOutOutput */
@@ -101,6 +102,24 @@ static size_t downmix_stereo(unsigned char *buf, size_t frames, int is_float) {
     }
     return frames*2*(is_float ? 4u : 2u);
 }
+/* steam-deck: the controller speaker (port type 4: phone calls, the spray can) on one side of the
+   Deck, like the speaker in the PS4 pad. The calls' icons are on the right of the screen, so the
+   right speaker by default; TLG_PAD_SPEAKER=left|right|both. Mono frames to stereo, in place. */
+static int pad_speaker_side(void) {
+    const char *e=getenv("TLG_PAD_SPEAKER");
+    if (!e || !*e || !strcmp(e,"right")) return 2;
+    return !strcmp(e,"left") ? 1 : 0;
+}
+static size_t mono_to_side(unsigned char *buf, size_t frames, int is_float, int side) {
+    const size_t sb=is_float ? 4u : 2u;
+    for (size_t f=frames;f-->0;) {
+        unsigned char v[4];
+        memcpy(v,buf+f*sb,sb);
+        memset(buf+f*2*sb,0,2*sb);
+        memcpy(buf+(f*2+(size_t)(side-1))*sb,v,sb);
+    }
+    return frames*2*sb;
+}
 static Port *port_of(int32_t handle, int32_t *error) {
     int id=handle & 0xff;
     if ((handle & 0x3f000000)!=0x20000000 || id>=PORTS) { *error=ERR_INVALID_PORT; return NULL; }
@@ -140,7 +159,8 @@ static int32_t open_port(int32_t type, uint32_t length, uint32_t freq, uint32_t 
         SDL_AudioSpec device; int device_frames;
         p->downmix=p->channels==8 && SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&device,&device_frames)
                    && device.channels==2;
-        SDL_AudioSpec spec={p->is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16, p->downmix ? 2 : p->channels, 48000};
+        p->pad_side=type==4 && p->channels==1 ? pad_speaker_side() : 0;
+        SDL_AudioSpec spec={p->is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16, p->downmix || p->pad_side ? 2 : p->channels, 48000};
         p->stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec,NULL,NULL);
         if (p->stream) SDL_ResumeAudioStreamDevice(p->stream);
         else fprintf(stderr,"Runtime: SDL audio stream failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
@@ -155,7 +175,8 @@ static int32_t open_port(int32_t type, uint32_t length, uint32_t freq, uint32_t 
     ++ports_opened;
     pthread_mutex_unlock(&table_lock);
     printf("Runtime: audio port %d opened (type %d, %d ch, %s, %u frames%s)\n",id,type,p->channels,p->is_float ? "float" : "s16",length,
-           p->downmix ? ", downmixed to stereo" : "");
+           p->downmix ? ", downmixed to stereo" : p->pad_side==2 ? ", pad speaker on the right" :
+           p->pad_side==1 ? ", pad speaker on the left" : "");
     if (runtime_verbose()) printf("Verbose: audio port %d: SDL stream %s, format code %u\n",id,p->stream ? "open" : "none (timer sink)",format);
     return (type<<16) | id | 0x20000000;
 }
@@ -201,6 +222,7 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             else { int16_t v; memcpy(&v,(const char *)data+from*2,2); v=(int16_t)((float)v*gain); memcpy(converted+to*2,&v,2); }
         }
         if (p->downmix) bytes=downmix_stereo(converted,(size_t)p->frames,p->is_float);
+        if (p->pad_side) bytes=mono_to_side(converted,(size_t)p->frames,p->is_float,p->pad_side);
         if (p->dump) fwrite(converted,1,bytes,p->dump);
         if (p->stats) {
             uint64_t now=now_ns();

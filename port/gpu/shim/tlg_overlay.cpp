@@ -24,6 +24,8 @@
 
 extern TlgActorSlot tlg_actor_slots[2];
 extern "C" void runtime_restart(void); // src/probe.c: starts run.py again, ends this process
+extern "C" void runtime_pause_guest(int pause); // src/runtime_thread.c (steam-deck)
+extern "C" void tlggpu_set_guest_paused(int paused);
 #include "common/elf_info.h"
 #include "common/backports.h"
 #include "shader_recompiler/recompiler_toggles.h"
@@ -66,6 +68,7 @@ namespace {
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
 bool initialized = false;
 std::atomic<bool> menu_open{false};
+std::atomic<int> open_request{-1}; // steam-deck: RequestOpen (pad thread) -> next present
 bool r3_down = false, l2_down = false;
 std::atomic<bool> loading{false};
 std::atomic<u32> loading_done{0}, loading_total{0};
@@ -354,9 +357,83 @@ std::string OverlayText() {
 constexpr const char* Unsupported = "Unavailable: game version or code signature mismatch.";
 
 
+// steam-deck: the simple part of the Graphics tab. Quality presets and switches for the game patches
+// (resolution, draw distance, shadows, particles, motion blur, reflections, the 30 FPS cap); the Deck's
+// launch script reads them from tlg.ini and builds the patches on the next start.
+void QualitySection() {
+    auto& s = TlgSettings::Get();
+    const bool pt = UiPortuguese();
+    static const char* const presets_pt[] = {"Alto", "Médio", "Baixo", "Personalizado"};
+    static const char* const presets_en[] = {"High", "Medium", "Low", "Custom"};
+    static const char* const levels_pt[] = {"Alto", "Médio", "Baixo"};
+    static const char* const levels_en[] = {"High", "Medium", "Low"};
+    static const char* const res_pt[] = {"1920x1200", "1600x1000", "1280x800", "960x600"};
+    static const char* const res_en[] = {"1920x1200", "1600x1000", "1280x800", "960x600"};
+    static const char* const fovs[] = {"100%", "95%", "90%", "85%", "80%"};
+    ImGui::SeparatorText(TL("Quality (applies when the game opens again)", "Qualidade (vale na próxima abertura do jogo)"));
+    if (!BeginRows("##quality")) {
+        return;
+    }
+    const int preset_before = s.gfx_preset;
+    ChoiceRow(TL("Preset", "Predefinição"), s.gfx_preset, pt ? presets_pt : presets_en, nullptr, 4,
+              TL("Sets everything below at once. High: the game as it is; Low: the most FPS.",
+                 "Ajusta tudo abaixo de uma vez. Alto: o jogo como é; Baixo: o máximo de FPS."));
+    if (s.gfx_preset != preset_before && s.gfx_preset < 3) {
+        const int p = s.gfx_preset;
+        s.gfx_resolution = p == 0 ? 0 : 2; // Médio e Baixo: o tamanho da tela do Deck
+        s.gfx_distance = p;
+        s.gfx_shadows = p;
+        s.particles = p;
+        s.gfx_motion_blur = p == 0;
+        s.gfx_ssr = p < 2;
+        dirty = true;
+    }
+    const int r = s.gfx_resolution, d = s.gfx_distance, sh = s.gfx_shadows, pa = s.particles;
+    const bool mb = s.gfx_motion_blur, ssr = s.gfx_ssr;
+    ChoiceRow(TL("Resolution", "Resolução"), s.gfx_resolution, pt ? res_pt : res_en, nullptr, 4,
+              TL("Size the game draws at. 1280x800 is the Deck's screen in 16:10, with no black bars; the others "
+                 "are 16:9 (bars above and below).",
+                 "Tamanho em que o jogo desenha. 1280x800 é a tela do Deck em 16:10, sem barras pretas; as outras "
+                 "são 16:9 (barras em cima e embaixo)."));
+    ChoiceRow(TL("Draw distance", "Distância de visão"), s.gfx_distance, pt ? levels_pt : levels_en, nullptr, 3,
+              TL("How far buildings and details appear. Lower draws less: more FPS.",
+                 "Até onde aparecem prédios e detalhes. Menor desenha menos: mais FPS."));
+    ChoiceRow(TL("Shadows", "Sombras"), s.gfx_shadows, pt ? levels_pt : levels_en, nullptr, 3,
+              TL("Sun shadow detail and reach. Shadows are about half of what the game draws.",
+                 "Detalhe e alcance das sombras do sol. As sombras são quase metade do que o jogo desenha."));
+    ChoiceRow(TL("Particles", "Partículas"), s.particles, pt ? levels_pt : levels_en, nullptr, 3,
+              TL("Fewer leftover effects and fewer particles per effect: powers and the special run faster.",
+                 "Menos efeitos que sobram e menos partículas por efeito: poderes e o especial ficam mais leves."));
+    CheckRow(TL("Motion blur", "Motion blur"), s.gfx_motion_blur,
+             TL("Blur when the camera moves fast.", "Desfoque quando a câmera mexe rápido."));
+    CheckRow(TL("Real-time reflections", "Reflexos em tempo real"), s.gfx_ssr,
+             TL("Reflections on wet streets and glass (screen-space). Off: more FPS.",
+                "Reflexos nas ruas molhadas e vidros (SSR). Desligado: mais FPS."));
+    if (s.gfx_preset < 3 && (s.gfx_resolution != r || s.gfx_distance != d || s.gfx_shadows != sh ||
+                             s.particles != pa || s.gfx_motion_blur != mb || s.gfx_ssr != ssr)) {
+        s.gfx_preset = 3; // a single item changed: custom
+        dirty = true;
+    }
+    ChoiceRow(TL("Field of view", "Campo de visão (FOV)"), s.gfx_fov, fovs, nullptr, 5,
+              TL("Smaller shows less around Delsin and makes everything bigger on the small screen.",
+                 "Menor mostra menos em volta do Delsin e deixa tudo maior na tela pequena."));
+    CheckRow(TL("Unlock 30 FPS", "Destravar 30 FPS"), s.gfx_unlock_fps,
+             TL("The game caps itself at 30 FPS; unlocked it goes as fast as the Deck allows.",
+                "O jogo se trava em 30 FPS; destravado vai até onde o Deck aguentar."));
+    CheckRow(TL("Show FPS", "Mostrar FPS"), s.show_fps,
+             TL("The performance overlay in a corner of the screen (applies now).",
+                "O contador de desempenho num canto da tela (vale na hora)."));
+    ImGui::EndTable();
+}
+
 void ImageTab() {
     namespace G = TlgGraphics;
     auto& s = TlgSettings::Get();
+    QualitySection();
+    // Everything that was here before stays, under "Advanced".
+    if (!ImGui::CollapsingHeader(TL("Advanced", "Avançado"))) {
+        return;
+    }
     ImGui::SeparatorText(TL("Display", "Tela"));
     if (BeginRows("##display")) {
         static const char* const modes[] = {TL("Windowed", "Janela"), TL("Borderless window", "Janela sem borda"), TL("Fullscreen", "Tela cheia")};
@@ -685,6 +762,813 @@ int RestartChanges() {
     return (s.render_resolution != s.startup_render_resolution) + (s.engine_fps != s.startup_engine_fps) +
            (s.deferred_readback != s.startup_deferred_readback) + (s.stale_readback != s.startup_stale_readback);
 }
+
+// ---- steam-deck: o menu do port no estilo do menu de pausa do inFAMOUS Second Son ----
+// Tela cheia sobre o último quadro do jogo (congelado pelo View): lista "OPÇÕES" à esquerda, explicação da opção
+// à direita, abas no topo (L1/R1) e dicas de botão embaixo. Desenhado direto na lista de desenho do ImGui (sem
+// janelas nem navegação do ImGui). Animações: os painéis crescem a partir do lado oposto, topo desce, rodapé sobe,
+// valor dá um "pop" ao mudar, interruptor desliza, aba ativa cresce e fica amarela, L1/R1 piscam em laranja.
+// O menu antigo continua no item "Menu avançado". TLG_CLASSIC_MENU=1 abre sempre o antigo.
+namespace DeckMenuImpl {
+
+ImFont* font_regular = nullptr;
+ImFont* font_bold = nullptr;
+double opened_at = 0.0;
+bool classic = false; // "Menu avançado" escolhido: o menu antigo até fechar
+bool shown = false;   // o menu novo já foi desenhado desde que abriu (a entrada começa no primeiro quadro)
+// Diálogo de fechar: 0 nenhum, 1 "salvar?", 2 "reiniciar agora?", 3 aviso "reinicie" com contagem.
+int dialog = 0, dialog_sel = 0;
+double closing_at = -1.0; // fechando: menu some, pausa, escurecimento some, depois o jogo volta
+double dialog_at = 0.0;
+std::atomic<bool> close_request{false}; // View com o menu aberto (thread da janela)
+struct Snapshot {
+    int preset, resolution, distance, shadows, particles, fov, subtitles;
+    bool motion_blur, ssr, unlock, fps;
+};
+Snapshot snap{};
+Snapshot Take() {
+    const auto& s = TlgSettings::Get();
+    return {s.gfx_preset, s.gfx_resolution, s.gfx_distance, s.gfx_shadows, s.particles, s.gfx_fov,
+            s.gfx_subtitles, s.gfx_motion_blur, s.gfx_ssr, s.gfx_unlock_fps, s.show_fps};
+}
+void Restore(const Snapshot& v) {
+    auto& s = TlgSettings::Get();
+    s.gfx_preset = v.preset; s.gfx_resolution = v.resolution; s.gfx_distance = v.distance;
+    s.gfx_shadows = v.shadows; s.particles = v.particles; s.gfx_fov = v.fov; s.gfx_subtitles = v.subtitles;
+    s.gfx_motion_blur = v.motion_blur; s.gfx_ssr = v.ssr; s.gfx_unlock_fps = v.unlock; s.show_fps = v.fps;
+}
+// Mudou alguma coisa? (restart: só as que valem na próxima abertura; Mostrar FPS vale na hora)
+bool Changed(bool restart_only) {
+    const Snapshot n = Take();
+    const bool gfx = n.preset != snap.preset || n.resolution != snap.resolution || n.distance != snap.distance ||
+                     n.shadows != snap.shadows || n.particles != snap.particles || n.fov != snap.fov ||
+                     n.subtitles != snap.subtitles ||
+                     n.motion_blur != snap.motion_blur || n.ssr != snap.ssr || n.unlock != snap.unlock;
+    return gfx || (!restart_only && n.fps != snap.fps);
+}
+bool CanRestart() {
+    const char* c = std::getenv("TLG_RESTART_COMMAND");
+    return c && *c;
+}
+
+enum class Kind { Section, Choice, Switch, Fixed, Action };
+struct Effect {
+    const char* label;
+    const char* value;
+    int tone; // 0 normal, 1 bom (verde), 2 destaque (amarelo)
+};
+struct Item {
+    Kind kind;
+    const char* label;
+    const char* help = "";
+    std::atomic<int>* choice = nullptr;
+    const char* const* names = nullptr;
+    int count = 0;
+    std::atomic<bool>* flag = nullptr;
+    const char* fixed = "";
+    std::vector<Effect> effects;
+    int id = 0; // ações e regras especiais
+};
+
+constexpr u32 Branco = IM_COL32(233, 231, 225, 255);
+constexpr u32 Texto = IM_COL32(217, 214, 207, 255);
+constexpr u32 Apagado = IM_COL32(139, 138, 134, 255);
+constexpr u32 Amarelo = IM_COL32(242, 182, 49, 255);
+constexpr u32 Laranja = IM_COL32(240, 138, 36, 255);
+constexpr u32 Verde = IM_COL32(159, 211, 107, 255);
+constexpr u32 Painel = IM_COL32(14, 15, 18, 200);
+constexpr u32 Faixa = IM_COL32(0, 0, 0, 184);
+
+int tab = 0;
+int sel = -1;
+float scroll = 0.0f, scroll_target = 0.0f;
+double tab_changed_at = -10.0, l1_at = -10.0, r1_at = -10.0, sel_changed_at = -10.0;
+int prev_tab = 0;
+std::array<std::array<double, 32>, 3> value_changed{}; // pop do valor, por aba e item
+std::array<std::array<double, 32>, 3> switch_changed{};
+
+float Ease(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+}
+u32 Alpha(u32 color, float a) {
+    const u32 alpha = u32(std::clamp(a, 0.0f, 1.0f) * float((color >> IM_COL32_A_SHIFT) & 0xFF));
+    return (color & ~IM_COL32_A_MASK) | (alpha << IM_COL32_A_SHIFT);
+}
+u32 Mix(u32 a, u32 b, float t) {
+    const auto ch = [&](int s) {
+        const float x = float((a >> s) & 0xFF), y = float((b >> s) & 0xFF);
+        return u32(x + (y - x) * std::clamp(t, 0.0f, 1.0f)) << s;
+    };
+    return ch(0) | ch(8) | ch(16) | ch(24);
+}
+
+std::vector<Item> Build(int which) {
+    auto& s = TlgSettings::Get();
+    const bool pt = UiPortuguese();
+    static const char* const levels_pt[] = {"Alto", "Médio", "Baixo"};
+    static const char* const levels_en[] = {"High", "Medium", "Low"};
+    static const char* const presets_pt[] = {"Alto", "Médio", "Baixo", "Personalizado"};
+    static const char* const presets_en[] = {"High", "Medium", "Low", "Custom"};
+    static const char* const res[] = {"1920x1200", "1600x1000", "1280x800", "960x600"};
+    static const char* const fovs[] = {"100%", "95%", "90%", "85%", "80%"};
+    const char* const* levels = pt ? levels_pt : levels_en;
+    std::vector<Item> v;
+    if (which == 0) {
+        v.push_back({Kind::Section, TL("Quality", "Qualidade")});
+        v.push_back({Kind::Choice, TL("Preset", "Predefinição"),
+                     TL("Sets everything below at once. High is the game as made for the PS4; Low is the most FPS on the Deck.",
+                        "Ajusta tudo abaixo de uma vez. Alto é o jogo como foi feito pro PS4; Baixo é o máximo de FPS no Deck."),
+                     &s.gfx_preset, pt ? presets_pt : presets_en, 4, nullptr, "",
+                     {{TL("Applies", "Vale"), TL("when the game opens again", "na próxima abertura"), 0}}, 1});
+        v.push_back({Kind::Choice, TL("Resolution", "Resolução"),
+                     TL("Size the game draws at, all in the Deck's 16:10 shape: no black bars, no stretching. 1280x800 is the screen's own size; higher is sharper and heavier, 960x600 is the lightest.",
+                        "Tamanho em que o jogo desenha, todos no formato 16:10 do Deck: sem barras pretas e sem esticar. 1280x800 é o tamanho da tela; acima fica mais nítido e mais pesado, 960x600 é o mais leve."),
+                     &s.gfx_resolution, res, 4, nullptr, "",
+                     {{TL("Picture", "Imagem"), TL("always full screen (16:10)", "sempre tela cheia (16:10)"), 0},
+                      {TL("Deck screen", "Tela do Deck"), "1280x800", 0}}, 2});
+        v.push_back({Kind::Choice, TL("Draw distance", "Distância de visão"),
+                     TL("How far buildings and details appear. On Low the horizon cards come in sooner; large pieces close by stay whole.",
+                        "Até onde aparecem prédios e detalhes. No Baixo, os cartões do horizonte entram mais cedo; peças grandes perto continuam inteiras."),
+                     &s.gfx_distance, levels, 3, nullptr, "",
+                     {{TL("Draws", "Desenhos"), TL("-30% to -40% on Low", "-30% a -40% no Baixo"), 1}}, 2});
+        v.push_back({Kind::Choice, TL("Shadows", "Sombras"),
+                     TL("Sun shadow detail and reach. Shadows are about a third of what the game draws each frame.",
+                        "Detalhe e alcance das sombras do sol. As sombras são um terço do que o jogo desenha em cada quadro."),
+                     &s.gfx_shadows, levels, 3, nullptr, "", {}, 2});
+        v.push_back({Kind::Choice, TL("Particles", "Partículas"),
+                     TL("Fewer leftover effects and fewer particles per effect: powers and the special run much lighter.",
+                        "Menos efeitos que sobram e menos partículas por efeito: poderes e o especial ficam bem mais leves."),
+                     &s.particles, levels, 3, nullptr, "",
+                     {{TL("Neon special", "Especial de neon"), TL("much lighter", "bem mais leve"), 1}}, 2});
+        v.push_back({Kind::Choice, TL("Field of view", "Campo de visão"),
+                     TL("Smaller shows less around Delsin and makes everything bigger on the Deck's small screen.",
+                        "Menor mostra menos em volta do Delsin e deixa tudo maior na tela pequena do Deck."),
+                     &s.gfx_fov, fovs, 5});
+        static const char* const subs_en[] = {"Original", "Medium", "Large", "Huge"};
+        static const char* const subs_pt[] = {"Original", "Média", "Grande", "Enorme"};
+        v.push_back({Kind::Choice, TL("Subtitle size", "Tamanho da legenda"),
+                     TL("The game's subtitles were made for a TV; on the Deck's screen Large reads easily. Long lines wrap a little wider.",
+                        "As legendas do jogo foram feitas pra TV; na tela do Deck o Grande lê fácil. Linhas longas quebram um pouco mais largas."),
+                     &s.gfx_subtitles, pt ? subs_pt : subs_en, 4});
+        v.push_back({Kind::Section, TL("Effects", "Efeitos")});
+        v.push_back({Kind::Switch, "Motion blur",
+                     TL("Blur when the camera moves fast. Off looks sharper on a small screen.",
+                        "Desfoque quando a câmera mexe rápido. Desligado fica mais nítido em tela pequena."),
+                     nullptr, nullptr, 0, &s.gfx_motion_blur, "", {}, 2});
+        v.push_back({Kind::Switch, TL("Real-time reflections", "Reflexos em tempo real"),
+                     TL("Reflections on wet streets and glass. Off gains FPS in the rain.",
+                        "Reflexos nas ruas molhadas e nos vidros. Desligado ganha FPS na chuva."),
+                     nullptr, nullptr, 0, &s.gfx_ssr, "", {{TL("In the rain", "Na chuva"), "+FPS", 1}}, 2});
+        v.push_back({Kind::Switch, TL("Unlock 30 FPS", "Destravar 30 FPS"),
+                     TL("The game caps itself at 30 FPS; unlocked it goes as fast as the Deck allows.",
+                        "O jogo se trava em 30 FPS. Destravado vai até onde o Deck aguentar."),
+                     nullptr, nullptr, 0, &s.gfx_unlock_fps});
+        v.push_back({Kind::Switch, TL("Show FPS", "Mostrar FPS"),
+                     TL("The performance counter in a corner of the screen. Applies right away.",
+                        "O contador de desempenho num canto da tela. Vale na hora."),
+                     nullptr, nullptr, 0, &s.show_fps});
+        v.push_back({Kind::Section, TL("Advanced", "Avançado")});
+        v.push_back({Kind::Action, TL("Advanced menu", "Menu avançado"),
+                     TL("Every technical option of the port (overlay, upscaler, performance switches, controls).",
+                        "Todas as opções técnicas do port (overlay, upscaler, chaves de desempenho, controles)."),
+                     nullptr, nullptr, 0, nullptr, TL("Open", "Abrir"), {}, 10});
+    } else if (which == 1) {
+        v.push_back({Kind::Section, TL("Graffiti and sensors", "Grafite e sensores")});
+        v.push_back({Kind::Fixed, TL("Shake the Deck", "Chacoalhar o Deck"),
+                     TL("Shaking the Deck up and down fills the spray can. Shake firmly for a moment.",
+                        "Sacudir o Deck pra cima e pra baixo enche a lata de spray. Sacuda firme por um tempinho."),
+                     nullptr, nullptr, 0, nullptr, TL("On", "Ligado")});
+        v.push_back({Kind::Fixed, TL("Tilt", "Inclinação"),
+                     TL("The Deck's gyroscope turns and aims the can, like the PS4 controller.",
+                        "O giroscópio do Deck vira e mira a lata, como o controle do PS4."),
+                     nullptr, nullptr, 0, nullptr, TL("Gyroscope", "Giroscópio")});
+        v.push_back({Kind::Section, "Trackpads"});
+        v.push_back({Kind::Fixed, TL("Touch and click", "Toque e clique"),
+                     TL("The two trackpads are the two halves of the PS4 touchpad. Pressing both counts as two fingers.",
+                        "Os dois trackpads são as duas metades do touchpad do PS4. Apertar os dois juntos vale como dois dedos."),
+                     nullptr, nullptr, 0, nullptr, TL("PS4 touchpad", "Touchpad do PS4")});
+        v.push_back({Kind::Section, TL("Back buttons", "Botões traseiros")});
+        static const char* const back_help_pt = "Os botões de trás do Deck repetem os botões da frente, pra pular, atacar e usar poderes sem tirar o polegar do analógico. Os ícones do jogo continuam os da frente.";
+        static const char* const back_help_en = "The Decks back buttons repeat the face buttons, so you can jump, attack and use powers without taking your thumb off the stick. The games icons stay the face ones.";
+        v.push_back({Kind::Fixed, "L4", pt ? back_help_pt : back_help_en, nullptr, nullptr, 0, nullptr, TL("Same as A", "Igual ao A")});
+        v.push_back({Kind::Fixed, "L5", pt ? back_help_pt : back_help_en, nullptr, nullptr, 0, nullptr, TL("Same as B", "Igual ao B")});
+        v.push_back({Kind::Fixed, "R4", pt ? back_help_pt : back_help_en, nullptr, nullptr, 0, nullptr, TL("Same as X", "Igual ao X")});
+        v.push_back({Kind::Fixed, "R5", pt ? back_help_pt : back_help_en, nullptr, nullptr, 0, nullptr, TL("Same as Y", "Igual ao Y")});
+        v.push_back({Kind::Section, TL("Buttons", "Botões")});
+        v.push_back({Kind::Fixed, TL("View button", "Botão View"),
+                     TL("Opens and closes this menu with the game frozen.", "Abre e fecha este menu com o jogo congelado."),
+                     nullptr, nullptr, 0, nullptr, TL("Port menu", "Menu do port")});
+        v.push_back({Kind::Fixed, TL("Steam button", "Botão Steam"),
+                     TL("With the Steam menu open the game stays still, like the PS button on a PS4.",
+                        "Com o menu da Steam aberto o jogo fica parado, como o botão PS no PS4."),
+                     nullptr, nullptr, 0, nullptr, TL("Freezes the game", "Congela o jogo")});
+    } else {
+        v.push_back({Kind::Section, "Port"});
+        v.push_back({Kind::Fixed, TL("Edition", "Edição"),
+                     TL("The native inFAMOUS Second Son port tuned for the Steam Deck: 16:10 full screen, Deck controls, its own menu and performance work.",
+                        "Port nativo do inFAMOUS Second Son ajustado pro Steam Deck: tela cheia 16:10, controles do Deck, menu próprio e otimizações de desempenho."),
+                     nullptr, nullptr, 0, nullptr, "Steam Deck",
+                     {{TL("Screen", "Tela"), TL("1280x800, no bars", "1280x800 sem barras"), 0},
+                      {TL("Controls", "Controles"), TL("trackpads, gyroscope, shake", "trackpads, giroscópio, chacoalhar"), 0}}});
+        v.push_back({Kind::Fixed, TL("Original port", "Port original"),
+                     TL("The native port this edition builds on: iss_pc, by HayatoG. It runs the game directly on the processor, with graphics adapted from the shadPS4 emulator.",
+                        "O port nativo em que esta edição se baseia: iss_pc, de HayatoG. Roda o jogo direto no processador, com a parte gráfica adaptada do emulador shadPS4."),
+                     nullptr, nullptr, 0, nullptr, "iss_pc",
+                     {{TL("Author", "Autor"), "HayatoG", 0}, {TL("Repository", "Repositório"), "github.com/HayatoG/iss_pc", 2},
+                      {TL("Graphics base", "Base gráfica"), "shadPS4", 0}}});
+        v.push_back({Kind::Section, TL("Credits", "Créditos")});
+        v.push_back({Kind::Fixed, TL("Steam Deck edition", "Edição Steam Deck"),
+                     TL("Steam Deck adaptation, performance, controls and this menu.",
+                        "Adaptação pro Steam Deck, desempenho, controles e este menu."),
+                     nullptr, nullptr, 0, nullptr, "Kewin Lima",
+                     {{"Instagram", "@kewinlima", 2}, {"GitHub", "KewinBR", 2}}});
+        v.push_back({Kind::Fixed, TL("Game", "Jogo"),
+                     TL("inFAMOUS Second Son (2014), Sucker Punch Productions and Sony Interactive Entertainment. This port needs your own copy of the game.",
+                        "inFAMOUS Second Son (2014), Sucker Punch Productions e Sony Interactive Entertainment. Este port precisa da sua própria cópia do jogo."),
+                     nullptr, nullptr, 0, nullptr, "Sucker Punch"});
+    }
+    return v;
+}
+
+// Maiúsculas que entendem acento (UTF-8, letras latinas acentuadas: C3 A0..BE -> C3 80..9E).
+std::string Upper(const char* text) {
+    std::string r(text);
+    for (size_t i = 0; i < r.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(r[i]);
+        if (c < 0x80) {
+            r[i] = char(std::toupper(c));
+        } else if (c == 0xC3 && i + 1 < r.size()) {
+            const unsigned char d = static_cast<unsigned char>(r[i + 1]);
+            if (d >= 0xA0 && d <= 0xBE && d != 0xB7) r[i + 1] = char(d - 0x20);
+            ++i;
+        } else if (c >= 0xC0 && c < 0xE0) {
+            ++i;
+        } else if (c >= 0xE0 && c < 0xF0) {
+            i += 2;
+        } else if (c >= 0xF0) {
+            i += 3;
+        }
+    }
+    return r;
+}
+
+// Som de abertura (swoosh): <pasta do usuário>/sons/menu_abrir.wav ou TLG_MENU_SOUND; sem arquivo, nada.
+// Botão Steam: o script de fora (congelar-no-menu-steam.py) cria TLG_STEAM_PAUSE_FILE enquanto o menu da Steam
+// cobre o jogo e apaga ao voltar. O port congela as threads do jogo (como no menu do View) e escurece a tela;
+// na volta, uma pausa curta, o escurecimento some e só então o jogo descongela.
+bool steam_paused = false;
+double steam_at = 0.0, steam_release_at = -1.0;
+void SteamPause(ImDrawList* dl, float W, float H) {
+    static const char* file = [] {
+        const char* e = std::getenv("TLG_STEAM_PAUSE_FILE");
+        return e && *e ? e : nullptr;
+    }();
+    if (!file) return;
+    const double now = ImGui::GetTime();
+    static double last_check = 0.0;
+    static bool present = false;
+    if (now - last_check > 0.05) {
+        last_check = now;
+        std::error_code ec;
+        present = std::filesystem::exists(file, ec);
+    }
+    if (present && !steam_paused) {
+        steam_paused = true;
+        steam_at = now;
+        steam_release_at = -1.0;
+        tlggpu_set_guest_paused(1);
+        runtime_pause_guest(1);
+        std::puts("Overlay: Steam menu, game frozen");
+    } else if (!present && steam_paused && steam_release_at < 0.0) {
+        steam_release_at = now;
+    } else if (present && steam_release_at >= 0.0) {
+        steam_release_at = -1.0; // abriu de novo antes de voltar
+        steam_at = now - 1.0;
+    }
+    if (!steam_paused) return;
+    // a volta espera o menu da Steam terminar de fechar (~0,3 s) antes de tirar o escurecimento
+    constexpr float Hold = 0.45f, Fade = 0.35f;
+    float dim = std::min(1.0f, float(now - steam_at) / 0.12f);
+    if (steam_release_at >= 0.0) {
+        const float tr = float(now - steam_release_at);
+        dim *= 1.0f - std::clamp((tr - Hold) / Fade, 0.0f, 1.0f);
+        if (tr >= Hold + Fade) {
+            steam_paused = false;
+            runtime_pause_guest(0);
+            tlggpu_set_guest_paused(0);
+            std::puts("Overlay: back from the Steam menu, game resumed");
+            return;
+        }
+    }
+    dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(118, 118, 118, u32(52 * dim)));
+    dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(W, H), IM_COL32(5, 6, 8, u32(205 * dim)),
+                                IM_COL32(5, 6, 8, u32(160 * dim)), IM_COL32(5, 6, 8, u32(180 * dim)),
+                                IM_COL32(5, 6, 8, u32(205 * dim)));
+}
+
+void PlayOpenSound() {
+    static SDL_AudioStream* stream = nullptr;
+    static Uint8* data = nullptr;
+    static Uint32 size = 0;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        std::string path;
+        if (const char* e = std::getenv("TLG_MENU_SOUND"); e && *e) {
+            path = e;
+        } else if (const char* u = std::getenv("TLG_GPU_USER_DIR"); u && *u) {
+            path = std::string(u) + "/sons/menu_abrir.wav";
+        }
+        SDL_AudioSpec spec{};
+        if (!path.empty() && SDL_InitSubSystem(SDL_INIT_AUDIO) && SDL_LoadWAV(path.c_str(), &spec, &data, &size)) {
+            stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+            if (stream) {
+                SDL_ResumeAudioStreamDevice(stream);
+            }
+        }
+    }
+    if (stream && data) {
+        SDL_ClearAudioStream(stream);
+        SDL_PutAudioStreamData(stream, data, int(size));
+    }
+}
+
+int FirstSelectable(const std::vector<Item>& items) {
+    for (int i = 0; i < int(items.size()); ++i) {
+        if (items[i].kind != Kind::Section) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+// Uma mudança de valor: as regras da predefinição (como na aba antiga) e o "pop".
+void Change(Item& it, int index, int step) {
+    auto& s = TlgSettings::Get();
+    const double now = ImGui::GetTime();
+    if (it.kind == Kind::Switch && it.flag) {
+        *it.flag = !it.flag->load();
+        switch_changed[tab][index] = now;
+    } else if (it.kind == Kind::Choice && it.choice) {
+        *it.choice = (it.choice->load() + step + it.count) % it.count;
+        value_changed[tab][index] = now;
+    } else if (it.kind == Kind::Action && it.id == 10) {
+        classic = true;
+        return;
+    } else {
+        return;
+    }
+    dirty = true;
+    if (it.id == 1 && s.gfx_preset < 3) {
+        const int p = s.gfx_preset;
+        s.gfx_resolution = p == 0 ? 0 : 2;
+        s.gfx_distance = p;
+        s.gfx_shadows = p;
+        s.particles = p;
+        s.gfx_motion_blur = p == 0;
+        s.gfx_ssr = p < 2;
+        for (auto& t : value_changed[tab]) t = now;
+    } else if (it.id == 2 && s.gfx_preset < 3) {
+        s.gfx_preset = 3; // um item só mudou: personalizado
+        value_changed[tab][1] = now;
+    }
+}
+
+void Text(ImDrawList* dl, ImFont* font, float size, ImVec2 pos, u32 color, const char* text, float wrap = 0.0f) {
+    dl->AddText(font, size, pos, color, text, nullptr, wrap);
+}
+ImVec2 Measure(ImFont* font, float size, const char* text) {
+    return font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+}
+
+void Draw() {
+    ImGuiIO& io = ImGui::GetIO();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float W = vp->Size.x, H = vp->Size.y;
+    const float u = W / 100.0f; // 1 cqw da prévia
+    ImFont* reg = font_regular ? font_regular : ImGui::GetFont();
+    ImFont* bold = font_bold ? font_bold : reg;
+    const double now = ImGui::GetTime();
+    static double last_draw = -10.0;
+    if (!shown || now - last_draw > 0.25) {
+        shown = true;
+        opened_at = now;
+        tab_changed_at = now - 10.5;
+        PlayOpenSound();
+        snap = Take();
+        dialog = 0;
+        close_request = false;
+        closing_at = -1.0;
+    }
+    last_draw = now;
+    io.MouseDrawCursor = false;
+    const float t = float(now - opened_at);
+    const bool pt = UiPortuguese();
+
+    // Entrada: painéis 0,55 s, topo e rodapé 0,45 s, conteúdo depois de 0,3 s.
+    const float e_list = Ease(t / 0.275f), e_ctx = Ease((t - 0.04f) / 0.275f);
+    const float e_top = Ease(t / 0.225f), e_bot = Ease((t - 0.025f) / 0.225f);
+    const float fade = std::clamp((t - 0.15f) / 0.15f, 0.0f, 1.0f);
+
+    // Entrada do teclado/controle.
+    static const char* const tab_names_pt[] = {"Gráficos", "Controle", "Sobre"};
+    static const char* const tab_names_en[] = {"Graphics", "Controls", "About"};
+    const char* const* tab_names = pt ? tab_names_pt : tab_names_en;
+    constexpr int TabCount = 3;
+    auto items = Build(tab);
+    if (sel < 0 || sel >= int(items.size()) || items[sel].kind == Kind::Section) {
+        sel = FirstSelectable(items);
+    }
+    const auto pressed = [](ImGuiKey a, ImGuiKey b = ImGuiKey_None, bool repeat = true) {
+        return ImGui::IsKeyPressed(a, repeat) || (b != ImGuiKey_None && ImGui::IsKeyPressed(b, repeat));
+    };
+    const auto go_tab = [&](int step) {
+        prev_tab = tab;
+        tab = (tab + step + TabCount) % TabCount;
+        tab_changed_at = now;
+        (step > 0 ? r1_at : l1_at) = now;
+        items = Build(tab);
+        sel = FirstSelectable(items);
+        scroll = scroll_target = 0.0f;
+    };
+    const bool want_close = close_request.exchange(false) || pressed(ImGuiKey_GamepadFaceRight, ImGuiKey_Escape, false);
+    const auto finish = [&] {
+        dialog = 0;
+        if (closing_at < 0.0) closing_at = now;
+    };
+    // Fechando: 0,18 s o menu some, 0,15 s de pausa, 0,25 s o escurecimento some; só então o menu fecha e o
+    // jogo descongela (a thread do controle espera o menu fechar).
+    constexpr float FadeMenu = 0.18f, Hold = 0.15f, FadeDim = 0.25f;
+    const float tc = closing_at < 0.0 ? 0.0f : float(now - closing_at);
+    if (closing_at >= 0.0 && tc >= FadeMenu + Hold + FadeDim) {
+        closing_at = -1.0;
+        SetOpen(false);
+        return;
+    }
+    const float menu_alpha = closing_at < 0.0 ? 1.0f : 1.0f - std::clamp(tc / FadeMenu, 0.0f, 1.0f);
+    const float dim_alpha = closing_at < 0.0 ? 1.0f : 1.0f - std::clamp((tc - FadeMenu - Hold) / FadeDim, 0.0f, 1.0f);
+    if (closing_at >= 0.0) {
+        close_request = false; // fechando: nada mais responde
+    }
+    const auto open_dialog = [&](int which) {
+        dialog = which;
+        dialog_sel = 0;
+        dialog_at = now;
+    };
+    if (closing_at >= 0.0) {
+        // ignora a entrada
+    } else if (dialog == 0 && want_close) {
+        if (Changed(false)) {
+            open_dialog(1);
+        } else {
+            finish();
+        }
+    } else if (dialog) {
+        const bool lr = pressed(ImGuiKey_GamepadDpadLeft, ImGuiKey_LeftArrow) || pressed(ImGuiKey_GamepadDpadRight, ImGuiKey_RightArrow) ||
+                        pressed(ImGuiKey_GamepadDpadUp, ImGuiKey_UpArrow) || pressed(ImGuiKey_GamepadDpadDown, ImGuiKey_DownArrow);
+        if (lr && dialog != 3) {
+            dialog_sel ^= 1;
+        }
+        const bool ok = pressed(ImGuiKey_GamepadFaceDown, ImGuiKey_Enter, false);
+        if (dialog == 1) {
+            if (want_close) {
+                dialog = 0; // B: volta pro menu
+            } else if (ok && dialog_sel == 1) { // Descartar
+                Restore(snap);
+                dirty = false;
+                finish();
+            } else if (ok) { // Salvar
+                const bool restart = Changed(true);
+                dirty = true;
+                TlgSettings::Save();
+                dirty = false;
+                if (!restart) {
+                    finish();
+                }
+                open_dialog(CanRestart() ? 2 : 3);
+            }
+        } else if (dialog == 2) {
+            if (want_close || (ok && dialog_sel == 1)) { // Depois
+                finish();
+            }
+            if (ok) {
+                std::puts("Settings: restarting the game to apply the graphics options");
+                runtime_restart();
+            }
+        } else if (dialog == 3 && (ok || want_close || now - dialog_at > 4.0)) {
+            finish();
+        }
+    }
+    const bool menu_input = dialog == 0 && closing_at < 0.0;
+    if (menu_input && pressed(ImGuiKey_GamepadR1, ImGuiKey_E, false)) go_tab(1);
+    if (menu_input && pressed(ImGuiKey_GamepadL1, ImGuiKey_Q, false)) go_tab(-1);
+    const auto move = [&](int step) {
+        int k = sel;
+        do {
+            k = (k + step + int(items.size())) % int(items.size());
+        } while (items[k].kind == Kind::Section);
+        sel = k;
+        sel_changed_at = now;
+    };
+    if (menu_input) {
+        if (pressed(ImGuiKey_GamepadDpadDown, ImGuiKey_DownArrow)) move(1);
+        if (pressed(ImGuiKey_GamepadDpadUp, ImGuiKey_UpArrow)) move(-1);
+        if (pressed(ImGuiKey_GamepadDpadRight, ImGuiKey_RightArrow)) Change(items[sel], sel, 1);
+        if (pressed(ImGuiKey_GamepadDpadLeft, ImGuiKey_LeftArrow)) Change(items[sel], sel, -1);
+        if (pressed(ImGuiKey_GamepadFaceDown, ImGuiKey_Enter, false)) Change(items[sel], sel, 1);
+    }
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // Fundo: o jogo congelado escurecido (mais à esquerda, onde fica a lista).
+    const float dim = std::min(1.0f, t / 0.12f) * dim_alpha;
+    dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(118, 118, 118, u32(52 * dim)));
+    dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(W, H), IM_COL32(5, 6, 8, u32(205 * dim)),
+                                IM_COL32(5, 6, 8, u32(160 * dim)), IM_COL32(5, 6, 8, u32(180 * dim)),
+                                IM_COL32(5, 6, 8, u32(205 * dim)));
+    const int menu_vtx0 = dl->VtxBuffer.Size; // tudo daqui pra frente apaga junto no fechamento
+
+    // ---- topo: L1, abas, R1 ----
+    {
+        const float h = 4.4f * u, y = 3.3f * u - (1.0f - e_top) * (h + 3.3f * u);
+        const float key_w = 5.4f * u, gap = 0.5f * u, x0 = 1.6f * u, x1 = W - 1.6f * u;
+        const auto key = [&](float x, const char* label, double at) {
+            dl->AddRectFilled(ImVec2(x, y), ImVec2(x + key_w, y + h), Faixa);
+            const float flash = 1.0f - std::clamp(float(now - at) / 0.25f, 0.0f, 1.0f);
+            const float sz = 1.9f * u * (1.0f + 0.15f * flash);
+            const ImVec2 ts = Measure(bold, sz, label);
+            const ImVec2 c(x + key_w * 0.5f, y + h * 0.5f);
+            dl->AddRectFilled(ImVec2(c.x - ts.x * 0.5f - 0.45f * u, c.y - ts.y * 0.5f - 0.1f * u),
+                              ImVec2(c.x + ts.x * 0.5f + 0.45f * u, c.y + ts.y * 0.5f + 0.1f * u),
+                              Mix(Branco, Laranja, flash), 0.25f * u);
+            Text(dl, bold, sz, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), IM_COL32(17, 17, 17, 255), label);
+        };
+        key(x0, "L1", l1_at);
+        key(x1 - key_w, "R1", r1_at);
+        dl->AddRectFilled(ImVec2(x0 + key_w + gap, y), ImVec2(x1 - key_w - gap, y + h), Faixa);
+        float x = x0 + key_w + gap + 2.0f * u;
+        const float k_tab = Ease(float(now - tab_changed_at) / 0.35f);
+        for (int i = 0; i < TabCount; ++i) {
+            float grow = i == tab ? k_tab : i == prev_tab && prev_tab != tab ? 1.0f - k_tab : 0.0f;
+            if (now - tab_changed_at > 10.0) grow = i == tab ? 1.0f : 0.0f;
+            const float sz = (1.75f + (3.1f - 1.75f) * grow) * u;
+            ImFont* f = grow > 0.5f ? bold : reg;
+            const ImVec2 ts = Measure(f, sz, tab_names[i]);
+            Text(dl, f, sz, ImVec2(x, y + (h - ts.y) * 0.5f), Mix(Apagado, Amarelo, grow), tab_names[i]);
+            x += ts.x + 2.6f * u;
+        }
+    }
+
+    // ---- lista ----
+    const float lx0 = 7.4f * u, ly0 = 10.6f * u, lw = 42.5f * u, ly1 = H - 8.6f * u;
+    {
+        const float cur_x0 = lx0 + lw * (1.0f - e_list); // cresce da direita pra esquerda
+        const float a = 0.2f + 0.8f * e_list;
+        dl->AddRectFilled(ImVec2(cur_x0, ly0), ImVec2(lx0 + lw, ly1), Alpha(Painel, a));
+        dl->AddRect(ImVec2(cur_x0, ly0), ImVec2(lx0 + lw, ly1), Alpha(Branco, a), 0.0f, 0, 0.12f * u);
+        const float n = 0.7f * u;
+        dl->AddRectFilled(ImVec2(cur_x0 - 0.4f * u, ly0 - 0.4f * u), ImVec2(cur_x0 - 0.4f * u + n, ly0 - 0.4f * u + n), Alpha(Branco, a));
+        dl->AddRectFilled(ImVec2(cur_x0 - 0.4f * u, ly1 - 0.3f * u), ImVec2(cur_x0 - 0.4f * u + n, ly1 - 0.3f * u + n), Alpha(Branco, a));
+        dl->AddRectFilled(ImVec2(lx0 + lw - 9.0f * u * e_list, ly0 - 0.5f * u), ImVec2(lx0 + lw, ly0), Alpha(Branco, a));
+
+        const float px = lx0 + 2.4f * u, py = ly0 + 1.7f * u;
+        const char* title = tab == 0 ? TL("Options", "Opções") : tab_names[tab];
+        std::string up = title;
+        up = Upper(up.c_str());
+        if (tab == 0) up = TL("OPTIONS", "OPÇÕES");
+        else if (tab == 1) up = TL("CONTROLS", "CONTROLE");
+        else up = TL("ABOUT", "SOBRE");
+        Text(dl, bold, 5.4f * u, ImVec2(px, py), Alpha(Amarelo, fade), up.c_str());
+
+        // itens, com rolagem que acompanha a seleção
+        const float area_y0 = py + 6.6f * u, area_y1 = ly1 - 1.4f * u, area_h = area_y1 - area_y0;
+        std::vector<float> ys(items.size());
+        float yy = 0.0f;
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (items[i].kind == Kind::Section && i) yy += 1.1f * u;
+            ys[i] = yy;
+            yy += items[i].kind == Kind::Section ? 3.0f * u : 2.6f * u;
+        }
+        const float total = yy;
+        if (ys[sel] - scroll_target < 0.0f) scroll_target = ys[sel] - (sel > 0 && items[sel - 1].kind == Kind::Section ? 3.4f * u : 0.0f);
+        if (ys[sel] + 2.6f * u - scroll_target > area_h) scroll_target = ys[sel] + 2.6f * u - area_h;
+        scroll_target = std::clamp(scroll_target, 0.0f, std::max(0.0f, total - area_h));
+        scroll += (scroll_target - scroll) * std::min(1.0f, io.DeltaTime * 14.0f);
+
+        dl->PushClipRect(ImVec2(lx0, area_y0 - 0.2f * u), ImVec2(lx0 + lw, area_y1 + 0.2f * u), true);
+        const float val_x1 = lx0 + lw - 4.0f * u; // coluna do valor: setas fixas
+        const float col_w = 13.5f * u, arrow_w = 1.4f * u;
+        for (size_t i = 0; i < items.size(); ++i) {
+            const Item& it = items[i];
+            const float y = area_y0 + ys[i] - scroll;
+            if (y > area_y1 + 3.0f * u || y < area_y0 - 4.0f * u) continue;
+            if (it.kind == Kind::Section) {
+                std::string sec = it.label;
+                sec = Upper(sec.c_str());
+                Text(dl, bold, 2.6f * u, ImVec2(px, y), Alpha(Branco, fade), sec.c_str());
+                continue;
+            }
+            const bool on = int(i) == sel;
+            const u32 col = Alpha(on ? Amarelo : Texto, fade);
+            const float fs = 1.75f * u;
+            Text(dl, reg, fs, ImVec2(px + 1.9f * u, y + 0.35f * u), col, it.label);
+            const float cy = y + 0.35f * u + fs * 0.6f;
+            const float pop = 1.0f + 0.35f * (1.0f - Ease(float(now - value_changed[tab][i]) / 0.32f));
+            if (it.kind == Kind::Choice) {
+                const char* val = it.names[std::clamp(it.choice->load(), 0, it.count - 1)];
+                const float sz = fs * pop;
+                const ImVec2 ts = Measure(reg, sz, val);
+                const float cx = val_x1 - arrow_w - col_w * 0.5f;
+                Text(dl, reg, sz, ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f), col, val);
+                if (on) {
+                    const float ah = 0.55f * u, ax0 = val_x1 - arrow_w - col_w - arrow_w * 0.5f, ax1 = val_x1 - arrow_w * 0.5f;
+                    dl->AddTriangleFilled(ImVec2(ax0 - ah * 0.5f, cy), ImVec2(ax0 + ah * 0.5f, cy - ah), ImVec2(ax0 + ah * 0.5f, cy + ah), col);
+                    dl->AddTriangleFilled(ImVec2(ax1 + ah * 0.5f, cy), ImVec2(ax1 - ah * 0.5f, cy - ah), ImVec2(ax1 - ah * 0.5f, cy + ah), col);
+                }
+            } else if (it.kind == Kind::Switch) {
+                const bool v = it.flag->load();
+                const float k = Ease(float(now - switch_changed[tab][i]) / 0.28f);
+                const float pos = v ? k : 1.0f - k; // 0 desligado, 1 ligado
+                const float sw = 3.4f * u, sh = 1.6f * u, sx = val_x1 - arrow_w - col_w * 0.5f - sw * 0.5f, sy = cy - sh * 0.5f;
+                dl->AddRect(ImVec2(sx, sy), ImVec2(sx + sw, sy + sh), col, 0.0f, 0, 0.12f * u);
+                const float pad = 0.2f * u, kw = sw * 0.5f - pad;
+                const float kx = sx + pad + pos * (sw - 2.0f * pad - kw);
+                dl->AddRectFilled(ImVec2(kx, sy + pad), ImVec2(kx + kw, sy + sh - pad), Alpha(on ? Amarelo : Texto, fade * (0.3f + 0.7f * pos)));
+            } else {
+                const ImVec2 ts = Measure(reg, fs, it.fixed);
+                Text(dl, reg, fs, ImVec2(val_x1 - ts.x, cy - ts.y * 0.5f), col, it.fixed);
+            }
+        }
+        dl->PopClipRect();
+        if (total > area_h + 1.0f) { // barra de rolagem
+            const float bx = lx0 + lw - 0.9f * u, by0 = area_y0, by1 = area_y1;
+            dl->AddRectFilled(ImVec2(bx, by0), ImVec2(bx + 0.12f * u, by1), Alpha(IM_COL32(233, 231, 225, 46), fade));
+            const float th = std::max(3.0f * u, (by1 - by0) * area_h / total);
+            const float ty = by0 + (by1 - by0 - th) * (scroll / std::max(1.0f, total - area_h));
+            dl->AddRectFilled(ImVec2(bx - 0.35f * u, ty), ImVec2(bx + 0.45f * u, ty + th), Alpha(IM_COL32(233, 231, 225, 150), fade));
+        }
+    }
+
+    // ---- contexto ----
+    {
+        const Item& it = items[sel];
+        const float cx0 = 54.4f * u, cy0 = 15.4f * u, cw = 37.6f * u, pad = 2.2f * u;
+        const float inner = cw - 2.0f * pad;
+        const float k_sel = Ease(float(now - std::max(sel_changed_at, tab_changed_at)) / 0.25f);
+        const float a_txt = fade * k_sel, dx = (1.0f - k_sel) * -0.8f * u;
+        float y = cy0 + 1.8f * u;
+        const float title_sz = 3.6f * u, help_sz = 1.6f * u;
+        std::string tt = it.label;
+        tt = Upper(tt.c_str());
+        const ImVec2 title_ts = bold->CalcTextSizeA(title_sz, FLT_MAX, inner, tt.c_str());
+        const ImVec2 help_ts = reg->CalcTextSizeA(help_sz, FLT_MAX, inner, it.help);
+        float h = 1.8f * u + 1.3f * u + 0.5f * u + title_ts.y + 1.1f * u + help_ts.y + 2.0f * u;
+        if (!it.effects.empty()) h += 1.6f * u + 1.2f * u + float(it.effects.size()) * 2.0f * u;
+        const float cur_x1 = cx0 + cw * e_ctx; // cresce da esquerda pra direita
+        const float a = 0.2f + 0.8f * e_ctx;
+        dl->AddRectFilled(ImVec2(cx0, cy0), ImVec2(cur_x1, cy0 + h), Alpha(Painel, a));
+        dl->AddRect(ImVec2(cx0, cy0), ImVec2(cur_x1, cy0 + h), Alpha(Branco, a), 0.0f, 0, 0.12f * u);
+        const float n = 0.7f * u;
+        dl->AddRectFilled(ImVec2(cx0 - 0.4f * u, cy0 - 0.4f * u), ImVec2(cx0 - 0.4f * u + n, cy0 - 0.4f * u + n), Alpha(Branco, a));
+        dl->AddRectFilled(ImVec2(cur_x1 - 0.3f * u, cy0 - 0.4f * u), ImVec2(cur_x1 - 0.3f * u + n, cy0 - 0.4f * u + n), Alpha(Branco, a));
+        dl->PushClipRect(ImVec2(cx0, cy0 - u), ImVec2(cur_x1, cy0 + h + u), true);
+        std::string rot = tab_names[tab];
+        rot = Upper(rot.c_str());
+        Text(dl, reg, 1.25f * u, ImVec2(cx0 + pad, y), Alpha(Apagado, fade), rot.c_str());
+        y += 1.3f * u + 0.5f * u;
+        Text(dl, bold, title_sz, ImVec2(cx0 + pad + dx, y), Alpha(Amarelo, a_txt), tt.c_str(), inner);
+        y += title_ts.y + 1.1f * u;
+        Text(dl, reg, help_sz, ImVec2(cx0 + pad + dx, y), Alpha(Texto, a_txt), it.help, inner);
+        y += help_ts.y;
+        if (!it.effects.empty()) {
+            y += 1.6f * u;
+            dl->AddLine(ImVec2(cx0 + pad, y), ImVec2(cx0 + cw - pad, y), Alpha(IM_COL32(233, 231, 225, 64), fade), 0.1f * u);
+            y += 1.2f * u;
+            for (const auto& ef : it.effects) {
+                std::string lab = ef.label;
+                lab = Upper(lab.c_str());
+                Text(dl, reg, 1.2f * u, ImVec2(cx0 + pad + dx, y + 0.15f * u), Alpha(Apagado, a_txt), lab.c_str());
+                const u32 vc = ef.tone == 1 ? Verde : ef.tone == 2 ? Amarelo : Branco;
+                Text(dl, reg, 1.5f * u, ImVec2(cx0 + pad + 11.0f * u + dx, y), Alpha(vc, a_txt), ef.value);
+                y += 2.0f * u;
+            }
+        }
+        dl->PopClipRect();
+        // selo
+        const char* selo = TL("STEAM DECK  ·  1280x800  ·  GAME FROZEN", "STEAM DECK  ·  1280x800  ·  JOGO CONGELADO");
+        const ImVec2 ss = Measure(reg, 1.2f * u, selo);
+        Text(dl, reg, 1.2f * u, ImVec2(W - 8.0f * u - ss.x, 46.0f * u), Alpha(Apagado, fade), selo);
+    }
+
+    // ---- rodapé ----
+    {
+        const float h = 3.7f * u, y = H - 2.2f * u - h + (1.0f - e_bot) * (h + 2.2f * u) * 1.6f;
+        const float bs = 2.1f * u, fs = 1.75f * u;
+        const auto hint = [&](float x_right, const char* label, int kind) {
+            const ImVec2 ts = Measure(reg, fs, label);
+            const float w = 1.6f * u + bs + 0.8f * u + ts.x + 1.6f * u + (kind == 2 ? 0.5f * u : 0.0f);
+            const float x0 = x_right - w;
+            dl->AddRectFilled(ImVec2(x0, y), ImVec2(x_right, y + h), Faixa);
+            const ImVec2 c(x0 + 1.6f * u + bs * 0.5f + (kind == 2 ? 0.25f * u : 0.0f), y + h * 0.5f);
+            if (kind == 2) { // View: dois retângulos sobrepostos
+                dl->AddRectFilled(ImVec2(c.x - 1.3f * u, c.y - 1.05f * u), ImVec2(c.x + 1.3f * u, c.y + 1.05f * u), Branco, 0.35f * u);
+                const u32 k = IM_COL32(17, 17, 17, 255);
+                dl->AddRect(ImVec2(c.x - 0.75f * u, c.y - 0.2f * u), ImVec2(c.x + 0.35f * u, c.y + 0.65f * u), k, 0.0f, 0, 0.16f * u);
+                dl->AddLine(ImVec2(c.x - 0.35f * u, c.y - 0.55f * u), ImVec2(c.x + 0.75f * u, c.y - 0.55f * u), k, 0.16f * u);
+                dl->AddLine(ImVec2(c.x + 0.75f * u, c.y - 0.55f * u), ImVec2(c.x + 0.75f * u, c.y + 0.3f * u), k, 0.16f * u);
+            } else {
+                dl->AddCircleFilled(c, bs * 0.5f, Branco, 24);
+                const char* letter = kind == 0 ? "A" : "B";
+                const ImVec2 ls = Measure(bold, 1.35f * u, letter);
+                Text(dl, bold, 1.35f * u, ImVec2(c.x - ls.x * 0.5f, c.y - ls.y * 0.5f), IM_COL32(17, 17, 17, 255), letter);
+            }
+            Text(dl, reg, fs, ImVec2(x0 + 1.6f * u + bs + 0.8f * u + (kind == 2 ? 0.5f * u : 0.0f), y + (h - ts.y) * 0.5f), Branco, label);
+            return x0;
+        };
+        const float right = W - 1.6f * u;
+        const float xb = hint(right, TL("Back", "Voltar"), 1);
+        hint(xb - 0.5f * u, TL("Select", "Selecionar"), 0);
+        // View à esquerda
+        const char* fechar = TL("Close", "Fechar");
+        const ImVec2 ts = Measure(reg, fs, fechar);
+        hint(1.6f * u + 1.6f * u + bs + 0.8f * u + ts.x + 1.6f * u + 0.5f * u, fechar, 2);
+    }
+
+    // ---- diálogo de fechar (salvar / reiniciar), no estilo dos painéis ----
+    if (dialog) {
+        const float k = Ease(float(now - dialog_at) / 0.15f);
+        dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, u32(110 * k)));
+        const float dw = 46.0f * u, dh = 21.0f * u, cx = W * 0.5f, cy = H * 0.5f;
+        const float hw = dw * 0.5f * k; // cresce do centro pros lados
+        const ImVec2 a(cx - hw, cy - dh * 0.5f), b(cx + hw, cy + dh * 0.5f);
+        dl->AddRectFilled(a, b, IM_COL32(14, 15, 18, 245));
+        dl->AddRect(a, b, Branco, 0.0f, 0, 0.12f * u);
+        const float n = 0.7f * u;
+        dl->AddRectFilled(ImVec2(a.x - 0.4f * u, a.y - 0.4f * u), ImVec2(a.x - 0.4f * u + n, a.y - 0.4f * u + n), Branco);
+        dl->AddRectFilled(ImVec2(b.x - 0.3f * u, b.y - 0.3f * u), ImVec2(b.x - 0.3f * u + n, b.y - 0.3f * u + n), Branco);
+        dl->AddRectFilled(ImVec2(b.x - 9.0f * u * k, a.y - 0.5f * u), ImVec2(b.x, a.y), Branco);
+        const float x0 = cx - dw * 0.5f + 2.6f * u, inner = dw - 5.2f * u;
+        const float fa = std::clamp((float(now - dialog_at) - 0.08f) / 0.12f, 0.0f, 1.0f);
+        const char* title = dialog == 1 ? TL("SAVE THE CHANGES?", "SALVAR AS ALTERAÇÕES?")
+                          : TL("RESTART TO APPLY", "REINICIE PARA APLICAR");
+        const char* body = dialog == 1
+            ? TL("You changed options in this menu. Save them, or go back to how they were when it opened.",
+                 "Você mudou opções neste menu. Salve, ou volte para como estavam quando ele abriu.")
+            : dialog == 2
+            ? TL("Graphics options apply when the game opens. Restart now? The game continues from the last save.",
+                 "As opções gráficas valem quando o jogo abre. Reiniciar agora? O jogo volta do último salvamento.")
+            : TL("Saved. Graphics options apply the next time the game opens.",
+                 "Salvo. As opções gráficas valem na próxima vez que o jogo abrir.");
+        dl->PushClipRect(a, b, true);
+        Text(dl, bold, 3.4f * u, ImVec2(x0, a.y + 2.0f * u), Alpha(Amarelo, fa), title);
+        Text(dl, reg, 1.65f * u, ImVec2(x0, a.y + 6.6f * u), Alpha(Texto, fa), body, x0 + inner);
+        if (dialog != 3) {
+            const char* opt[2] = {dialog == 1 ? TL("Save", "Salvar") : TL("Restart now", "Reiniciar agora"),
+                                  dialog == 1 ? TL("Discard", "Descartar") : TL("Later", "Depois")};
+            const float bw = 15.0f * u, bh = 3.6f * u, by = b.y - 2.4f * u - bh;
+            for (int i = 0; i < 2; ++i) {
+                const float bx = x0 + i * (bw + 1.4f * u);
+                const bool on = dialog_sel == i;
+                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), on ? Alpha(Amarelo, fa) : IM_COL32(0, 0, 0, u32(150 * fa)));
+                if (!on) dl->AddRect(ImVec2(bx, by), ImVec2(bx + bw, by + bh), Alpha(IM_COL32(233, 231, 225, 120), fa), 0.0f, 0, 0.1f * u);
+                const ImVec2 ts = Measure(bold, 1.75f * u, opt[i]);
+                Text(dl, bold, 1.75f * u, ImVec2(bx + (bw - ts.x) * 0.5f, by + (bh - ts.y) * 0.5f),
+                     on ? IM_COL32(17, 17, 17, u32(255 * fa)) : Alpha(Branco, fa), opt[i]);
+            }
+        } else {
+            // contagem pra voltar ao jogo
+            const float left = std::clamp(1.0f - float(now - dialog_at) / 4.0f, 0.0f, 1.0f);
+            const float by = b.y - 3.0f * u;
+            dl->AddRectFilled(ImVec2(x0, by), ImVec2(x0 + inner, by + 0.35f * u), IM_COL32(233, 231, 225, u32(50 * fa)));
+            dl->AddRectFilled(ImVec2(x0, by), ImVec2(x0 + inner * left, by + 0.35f * u), Alpha(Amarelo, fa));
+        }
+        dl->PopClipRect();
+    }
+    if (menu_alpha < 1.0f) { // fade do menu inteiro (vértices já gravados)
+        for (int i = menu_vtx0; i < dl->VtxBuffer.Size; ++i) {
+            ImU32& c = dl->VtxBuffer[i].col;
+            const u32 a = u32(float((c >> IM_COL32_A_SHIFT) & 0xFF) * menu_alpha);
+            c = (c & ~IM_COL32_A_MASK) | (a << IM_COL32_A_SHIFT);
+        }
+    }
+}
+
+void LoadFonts(ImGuiIO& io) {
+    const char* custom = std::getenv("TLG_MENU_FONT");
+    const char* custom_bold = std::getenv("TLG_MENU_FONT_BOLD");
+    std::error_code ec;
+    const auto pick = [&](const char* env, const char* fallback) -> std::string {
+        if (env && *env && std::filesystem::exists(env, ec)) return env;
+        return std::filesystem::exists(fallback, ec) ? fallback : "";
+    };
+    // TLG_MENU_FONT / TLG_MENU_FONT_BOLD: ISS-Texto.ttf e ISS-Titulo.ttf (fonte_jogo_ttf.py, da fonte do jogo)
+    const std::string reg = pick(custom, "/usr/share/fonts/TTF/DejaVuSansCondensed.ttf");
+    const std::string bol = pick(custom_bold, "/usr/share/fonts/TTF/DejaVuSansCondensed-Bold.ttf");
+    if (!reg.empty()) font_regular = io.Fonts->AddFontFromFileTTF(reg.c_str(), 18.0f);
+    if (!bol.empty()) font_bold = io.Fonts->AddFontFromFileTTF(bol.c_str(), 18.0f);
+}
+
+} // namespace DeckMenuImpl
 
 void Menu() {
     auto& s = TlgSettings::Get();
@@ -1302,23 +2186,22 @@ void SaveProgressBox(SaveClock::time_point now) {
 }
 
 void SaveToastBox(SaveClock::time_point now) {
+    // steam-deck: discreet, as the Kewin asked: only a small "Salvando..." in the bottom-right
+    // corner (no card, icon or game name), with a soft shadow so it reads on any scene.
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const char* text = toast_kind == 2 ? TL("Save loaded", "Save carregado")
-                       : toast_kind == 3 ? TL("Save deleted", "Save excluído")
-                                         : TL("Game saved", "Jogo salvo");
+    const char* text = toast_kind == 2 ? TL("Loading...", "Carregando...")
+                       : toast_kind == 3 ? TL("Deleting...", "Excluindo...")
+                                         : TL("Saving...", "Salvando...");
     const float in = std::chrono::duration<float>(now - toast_since).count();
     const float out = std::chrono::duration<float>(toast_until - now).count();
-    const float alpha = std::clamp(std::min(in / 0.15f, out / 0.4f), 0.0f, 1.0f);
+    const float alpha = std::clamp(std::min(in / 0.2f, out / 0.5f), 0.0f, 1.0f) * 0.85f;
     const float k = viewport->WorkSize.y / 720.0f;
     SavePainter p{ImGui::GetForegroundDrawList(), ImGui::GetFont(), k, {}};
-    const float w = 18 + 22 + 12 + p.Width(14.0f, text) + 20, h = 46;
-    p.at = ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - (32 + w) * k,
-                  viewport->WorkPos.y + viewport->WorkSize.y - (28 + h) * k);
-    p.Box(0, 0, w, h, kSavePanel, 14.0f, 0.92f * alpha);
-    p.Frame(0, 0, w, h, kSaveBorder, 14.0f, 1.0f, alpha);
-    p.Line(18, 24, 24, 30, kSaveOk, 2.4f, alpha); // a check mark
-    p.Line(24, 30, 36, 17, kSaveOk, 2.4f, alpha);
-    p.Text(52, 14, 14.0f, kSaveText, text, true, alpha);
+    const float w = p.Width(13.0f, text);
+    p.at = ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - (22 + w) * k,
+                  viewport->WorkPos.y + viewport->WorkSize.y - (22 + 16) * k);
+    p.Text(1, 1, 13.0f, 0x000000, text, false, alpha * 0.6f);
+    p.Text(0, 0, 13.0f, 0xe6e9ee, text, false, alpha);
 }
 
 // ---- The graffiti guide: how to paint without a gyro (sensor mode). Shown in the middle of the
@@ -1579,6 +2462,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     font_config.FontDataOwnedByAtlas = false;
     io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(tlg_font_ttf),
                                    int(tlg_font_ttf_end - tlg_font_ttf), 18.0f, &font_config);
+    DeckMenuImpl::LoadFonts(io);
 
     const vk::Instance vk_instance = instance.GetInstance();
     ImGui_ImplVulkan_LoadFunctions(
@@ -1847,6 +2731,18 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_GAMEPAD_BUTTON_UP: {
         const bool down = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
         const u8 button = event.gbutton.button;
+        // steam-deck: View closes the open menu (runtime_pad opens it, after pausing the game).
+        if (button == SDL_GAMEPAD_BUTTON_BACK && is_open) {
+            if (down) {
+                const char* classic_env = std::getenv("TLG_CLASSIC_MENU");
+                if (DeckMenuImpl::classic || (classic_env && classic_env[0] == '1')) {
+                    SetOpen(false);
+                } else {
+                    DeckMenuImpl::close_request = true;
+                }
+            }
+            return true;
+        }
         // R3+L2 opens the menu: L3+R3 is a game action in God of War III.
         if (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
             r3_down = down;
@@ -1970,7 +2866,16 @@ void SetMousePad(bool active, float x, float y, bool touching, bool clicking) {
 bool Visible() {
     const auto& s = TlgSettings::Get();
     const auto now = std::chrono::steady_clock::now();
-    return initialized && (loading || background_total || menu_open || text_entry_active || choice_active ||
+    static const char* steam_file = std::getenv("TLG_STEAM_PAUSE_FILE");
+    static auto steam_checked = std::chrono::steady_clock::time_point{};
+    static bool steam_file_present = false;
+    if (steam_file && *steam_file && now - steam_checked > std::chrono::milliseconds(50)) {
+        steam_checked = now;
+        std::error_code ec;
+        steam_file_present = std::filesystem::exists(steam_file, ec);
+    }
+    return initialized && (loading || background_total || menu_open || open_request.load() >= 0 ||
+                           steam_file_present || DeckMenuImpl::steam_paused || text_entry_active || choice_active ||
                            message_active || guide_active || progress_on || now < progress_until || now < toast_until ||
                            NoticeActive() || mouse_pad_on ||
                            choice_retiring || s.show_fps ||
@@ -1979,6 +2884,14 @@ bool Visible() {
 
 bool CapturesInput() {
     return menu_open || text_entry_active || choice_active || message_active || guide_active;
+}
+
+bool MenuOpen() {
+    return menu_open;
+}
+
+void RequestOpen(bool open) {
+    open_request.store(open ? 1 : 0, std::memory_order_release);
 }
 
 void ShowGraffitiGuide(bool force) {
@@ -2101,6 +3014,11 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
     }
     ConfirmRestart();
+    // steam-deck: opened or closed from the pad thread (View button, RequestOpen).
+    if (const int request = open_request.exchange(-1, std::memory_order_acq_rel); request >= 0) {
+        std::scoped_lock lock{imgui_mutex};
+        SetOpen(request != 0);
+    }
     if (!Visible()) {
         return;
     }
@@ -2123,8 +3041,23 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (loading) {
         LoadingScreen();
     }
+    if (!menu_open) {
+        DeckMenuImpl::SteamPause(ImGui::GetForegroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);
+    }
     if (menu_open) {
-        Menu();
+        static const bool classic_env = [] {
+            const char* e = std::getenv("TLG_CLASSIC_MENU");
+            return e && e[0] == '1';
+        }();
+        if (classic_env || DeckMenuImpl::classic) {
+            ImGui::GetIO().MouseDrawCursor = true;
+            Menu();
+        } else {
+            DeckMenuImpl::Draw();
+        }
+    } else {
+        DeckMenuImpl::shown = false;
+        DeckMenuImpl::classic = false;
     }
     if (TlgSettings::Get().show_fps && !menu_open) {
         FpsCounter();

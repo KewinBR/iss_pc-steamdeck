@@ -1735,9 +1735,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            // steam-deck: TLG_ASC_WAIT_YIELD=1: an unmet wait first yields to the other queues once
+            // (the graphics queue keeps feeding the draw pipe while stage B catches up to the
+            // fence) and drains only if the value is still missing when this queue runs again.
+            // The drain left stage B idle ~18% of the frame on the Steam Deck (stage A waited 20%
+            // here, 2026-10-19). Cross-queue order needs only the fence, as on the real GPU.
+            static const bool yield_first = [] {
+                const char* env = std::getenv("TLG_ASC_WAIT_YIELD");
+                return env && env[0] == '1';
+            }();
+            bool yielded = false;
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 // tlg: the value may come from a fence the recording thread has yet to write.
                 if (pipelined && !rasterizer->DrawPipeIdle()) {
+                    if (yield_first && !yielded) {
+                        yielded = true;
+                        YIELD_ASC(vqid);
+                        continue;
+                    }
                     rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     continue;
                 }

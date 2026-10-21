@@ -801,8 +801,16 @@ void runtime_restart(void) {
     /* The new launch waits for this process's GPU device to go away (run.py --after). */
     TerminateProcess(GetCurrentProcess(),0);
 #else
-    puts("Runtime: restarting through run.sh");
+    /* steam-deck: TLG_RESTART_COMMAND (the Deck's launch script) runs in this same process, so Steam keeps
+     * the session; it rebuilds the game patches from the saved options. */
+    const char *command=getenv("TLG_RESTART_COMMAND");
     syscall(SYS_close_range, 3u, ~0u, 0u);
+    if (command && *command) {
+        printf("Runtime: restarting through %s\n", command);
+        fflush(NULL);
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+    }
+    puts("Runtime: restarting through run.sh");
     execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
     _exit(1);
