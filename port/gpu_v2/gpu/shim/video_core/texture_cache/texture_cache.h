@@ -245,6 +245,10 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
+    /// steam-deck: TLG_TEXTURE_REPLACE_DIR: uploads a replacement (.tlgtex) instead of the guest
+    /// texture when the guest bytes hash to one the replacement names. True when it did.
+    bool ReplaceImage(Image& image);
+
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,

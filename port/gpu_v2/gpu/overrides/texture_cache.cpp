@@ -9,6 +9,8 @@
 #include "gpu_blackbox.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <set>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -66,6 +68,69 @@ bool TextureCache::WithNegativeSnapshotsLocked(
     }
     return publish();
 }
+
+namespace {
+// steam-deck: textures swapped by content (the spray minigame's PS4-controller icons drawn with a
+// Steam Deck). Each <dir>/*.tlgtex: "TLGTEX1\0", u64 XXH3 of the guest texture's bytes (guest_size,
+// tiled, all mips), u32 width, height, levels, then the BC3 blocks of each mip in linear order.
+// Made by nativo/ferramentas/texturas/tlgtex.py; only images of a listed size are hashed.
+struct TexReplacement {
+    u32 width, height, levels;
+    std::vector<u8> blocks;
+};
+struct TexReplacements {
+    std::unordered_map<u64, TexReplacement> by_hash;
+    std::set<std::pair<u32, u32>> sizes;
+};
+u64 Bc3ChainBytes(u32 width, u32 height, u32 levels) {
+    u64 total = 0;
+    for (u32 m = 0; m < levels; ++m) {
+        total += u64(Common::DivCeil(std::max(width >> m, 1u), 4u)) *
+                 Common::DivCeil(std::max(height >> m, 1u), 4u) * 16;
+    }
+    return total;
+}
+const TexReplacements& Replacements() {
+    static const TexReplacements r = [] {
+        TexReplacements out;
+        const char* dir = std::getenv("TLG_TEXTURE_REPLACE_DIR");
+        if (!dir || !*dir) {
+            return out;
+        }
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            if (e.path().extension() != ".tlgtex") {
+                continue;
+            }
+            std::FILE* f = std::fopen(e.path().c_str(), "rb");
+            if (!f) {
+                continue;
+            }
+            char magic[8];
+            u64 hash = 0;
+            u32 hdr[3];
+            TexReplacement t{};
+            if (std::fread(magic, 1, 8, f) == 8 && !std::memcmp(magic, "TLGTEX1", 8) &&
+                std::fread(&hash, 8, 1, f) == 1 && std::fread(hdr, 4, 3, f) == 3) {
+                t.width = hdr[0];
+                t.height = hdr[1];
+                t.levels = hdr[2];
+                t.blocks.resize(Bc3ChainBytes(t.width, t.height, t.levels));
+                if (std::fread(t.blocks.data(), 1, t.blocks.size(), f) == t.blocks.size()) {
+                    std::printf("TexReplace: %s (%ux%u, %u mips, %016llx)\n",
+                                e.path().filename().c_str(), t.width, t.height, t.levels,
+                                static_cast<unsigned long long>(hash));
+                    out.sizes.emplace(t.width, t.height);
+                    out.by_hash.emplace(hash, std::move(t));
+                }
+            }
+            std::fclose(f);
+        }
+        return out;
+    }();
+    return r;
+}
+} // namespace
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -1228,6 +1293,66 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return FindViewMemoized(image_id, desc.view_info, false);
 }
 
+bool TextureCache::ReplaceImage(Image& image) {
+    const TexReplacements& reps = Replacements();
+    const ImageInfo& info = image.info;
+    if (reps.by_hash.empty() || !info.props.is_block ||
+        info.resources.layers != 1 || !reps.sizes.contains({info.size.width, info.size.height})) {
+        return false;
+    }
+    if (!Core::Memory::Instance()->IsValidGpuMapping(info.guest_address, info.guest_size)) {
+        return false;
+    }
+    const u64 hash = XXH3_64bits(std::bit_cast<const u8*>(info.guest_address), info.guest_size);
+    const auto it = reps.by_hash.find(hash);
+    if (it == reps.by_hash.end()) {
+        static std::set<u64> logged; // tamanho de uma troca, outro conteúdo: o hash pra fazer outra
+        if (logged.insert(hash).second && std::getenv("TLG_TEXTURE_REPLACE_LOG")) {
+            std::printf("TexReplace: candidate %ux%u, %u mips, %u bytes, hash %016llx\n",
+                        info.size.width, info.size.height, info.resources.levels, info.guest_size,
+                        static_cast<unsigned long long>(hash));
+        }
+        return false;
+    }
+    const TexReplacement& t = it->second;
+    if (t.width != info.size.width || t.height != info.size.height ||
+        t.levels < info.resources.levels) {
+        return false;
+    }
+    boost::container::small_vector<vk::BufferImageCopy, 14> copies;
+    const u64 total = Bc3ChainBytes(t.width, t.height, info.resources.levels);
+    const auto staging = runtime.GetStagingPool().Request(total, MemoryType::HostUncached, 16);
+    std::memcpy(staging.mapped, t.blocks.data(), total);
+    u64 offset = 0;
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        const u32 width = std::max(t.width >> m, 1u);
+        const u32 height = std::max(t.height >> m, 1u);
+        copies.push_back({
+            .bufferOffset = staging.offset + offset,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = m,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, 1},
+        });
+        offset += Bc3ChainBytes(width, height, 1);
+    }
+    staging.Flush();
+    scheduler.EndRendering();
+    runtime.UploadImage(&image, staging.buffer, copies);
+    static std::set<u64> shown;
+    if (shown.insert(hash).second) {
+        std::printf("TexReplace: replaced %ux%u at %llx\n", t.width, t.height,
+                    static_cast<unsigned long long>(info.guest_address));
+    }
+    return true;
+}
+
 void TextureCache::RefreshImage(Image& image) {
     AssertNoAscTextureAccess();
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
@@ -1262,6 +1387,10 @@ void TextureCache::RefreshImage(Image& image) {
             return;
         }
         image.hash = hash;
+    }
+
+    if (ReplaceImage(image)) {
+        return;
     }
 
     const u32 num_layers = image.info.resources.layers;
