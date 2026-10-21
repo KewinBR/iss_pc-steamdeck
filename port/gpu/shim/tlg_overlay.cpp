@@ -34,6 +34,14 @@ extern TlgActorSlot tlg_actor_slots[2];
 extern "C" void runtime_restart(void); // src/probe.c: starts run.py again, ends this process
 extern "C" void runtime_pause_guest(int pause); // src/runtime_thread.c (steam-deck)
 extern "C" void tlggpu_set_guest_paused(int paused);
+// steam-deck: View opens the menu (runtime_pad.c, the game paused); R3+L2 only with TLG_VIEW_MENU=0.
+static bool ViewMenu() {
+    static const bool on = [] {
+        const char* e = std::getenv("TLG_VIEW_MENU");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 #include "common/elf_info.h"
 #ifndef TLG_RENDERER_V2
 #include "common/backports.h"
@@ -1625,7 +1633,8 @@ void Menu() {
         const std::string_view title = Common::ElfInfo::Instance().Title();
         const char* app_name = std::getenv("TLG_APP_NAME");
         return std::string(!title.empty() ? title : app_name && *app_name ? app_name : "The Last Guardian") +
-               PadText("  (Insert / R3+L2)", "  (Insert / RS+LT)", "  (Insert / RS+ZL)");
+               (ViewMenu() ? std::string("  (View)")
+                           : std::string(PadText("  (Insert / R3+L2)", "  (Insert / RS+LT)", "  (Insert / RS+ZL)")));
     }();
     if (!ImGui::Begin(heading.c_str(), &keep_open, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
@@ -2797,8 +2806,8 @@ bool HandleEvent(const SDL_Event& event) {
             }
             return true;
         }
-        // R3+L2 opens the menu: L3+R3 is a game action in God of War III.
-        if (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
+        // R3+L2 opens the menu: L3+R3 is a game action in God of War III. steam-deck: View only.
+        if (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK && !ViewMenu()) {
             r3_down = down;
             if (down && l2_down) {
                 SetOpen(!is_open);
@@ -2816,7 +2825,7 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
         if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
             const bool down = event.gaxis.value > 16000;
-            if (down && !l2_down && r3_down) {
+            if (down && !l2_down && r3_down && !ViewMenu()) {
                 l2_down = true;
                 SetOpen(!is_open);
                 return true;

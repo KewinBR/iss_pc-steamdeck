@@ -756,7 +756,7 @@ static void sample_host(PadData *d) {
     SDL_Gamepad *g=current_gamepad();
     /* steam-deck: View with the menu closed freezes the game (every other guest thread waits in a signal, the
      * VideoOut loop keeps showing the last frame) and opens the port's menu over it. This thread, the one
-     * reading the pad, waits here until the menu closes (View again, handled on the window thread; R3+L2;
+     * reading the pad, waits here until the menu closes (View again, handled on the window thread;
      * Esc), then everything resumes. A View press right after a close is ignored (the same press closed it). */
     if (deck_view_menu()) {
         static bool view_prev;
