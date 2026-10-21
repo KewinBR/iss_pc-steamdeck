@@ -48,7 +48,8 @@ def _ab(key, env, default, shader, live, name, what, store='ini', pass_env=True,
 
 
 def _ab_choice(key, env, default, choices, name, what, **kw):
-    return _make(env, 'ab', key, env, 'choice', default, name, what, choices=choices, pass_env=True, **kw)
+    kw.setdefault('pass_env', True)
+    return _make(env, 'ab', key, env, 'choice', default, name, what, choices=choices, **kw)
 
 
 def _menu(tab, key, vtype, default, name, what, **kw):
@@ -244,6 +245,24 @@ DIAGNOSTICS = [
         ('Still crashes the game on the NVIDIA 595 driver; off by default in this port.',
          'Ainda derruba o jogo no driver NVIDIA 595; desligado por padrão neste port.'),
         broken=True),
+    _ab_choice('renderer', 'TLG_RENDERER', '1',
+               (('1', '1 · This port\'s renderer', '1 · Renderer deste port'),
+                ('2', '2 · Renderer v2 (experimental)', '2 · Renderer v2 (experimental)')),
+               ('Renderer', 'Renderer'),
+               ('Renderer v2 (port/gpu_v2): another renderer with this port\'s interface, its own fixes and '
+                'its own shader cache (the first start compiles the shaders again). Needs the v2 build '
+                '(TLG_RENDERER_V2=1 build.sh); without it the game starts with this port\'s renderer.',
+                'Renderer v2 (port/gpu_v2): outro renderer com a interface deste port, as próprias correções e '
+                'o próprio cache de shaders (a primeira partida compila os shaders de novo). Precisa do build '
+                'v2 (TLG_RENDERER_V2=1 build.sh); sem ele o jogo abre com o renderer deste port.'),
+               source='launcher (infamous_run.py)', pass_env=False),
+    _ab('native_passes', 'TLG_NATIVE_PASSES', False, False, False,
+        ('Native passes (renderer v2 only)', 'Native passes (só no renderer v2)'),
+        ('Renderer v2 records the game\'s draws straight into Vulkan when the game submits them. Off by '
+         'default: on NVIDIA\'s Linux driver it can drop frames or crash. Has no effect on this port\'s renderer.',
+         'O renderer v2 grava os desenhos do jogo direto no Vulkan quando o jogo os envia. Desligado por '
+         'padrão: no driver NVIDIA do Linux pode derrubar quadros ou travar. Não tem efeito no renderer deste port.'),
+        pass_env=False),
     _ab_choice('occlusion_mode', 'TLG_OCCLUSION_MODE', '4',
                (('0', '0 · As before (fake counter, glare may show through)', '0 · Como antes (contador falso, o brilho pode atravessar)'),
                 ('1', '1 · Lights count as hidden', '1 · Luzes contam como tapadas'),

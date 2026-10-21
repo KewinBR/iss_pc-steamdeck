@@ -255,6 +255,10 @@ private:
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available
+    /// tlg: TLG_COMPUTE_FAIRNESS: compute submissions not finished yet, and the graphics packets
+    /// processed since the graphics queue last gave way to them (ProcessGraphics).
+    std::atomic<u32> asc_submits{};
+    u32 gfx_packets_since_yield{};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};

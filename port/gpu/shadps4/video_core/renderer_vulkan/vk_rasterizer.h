@@ -159,6 +159,12 @@ public:
     /// Stage A: guest memory the recording thread will write for work handed to it (storage
     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
     void NotePendingGpuWrite(VAddr address, u64 size);
+    /// tlg: TLG_UNIFIED_MEMORY: an end-of-pipe fence, written by `write` once the GPU has
+    /// finished the work recorded so far (its writes made visible to the host). False when unified
+    /// memory is off: the caller writes it as before.
+    bool DeferUnifiedFence(Common::UniqueFunction<void>&& write);
+    /// tlg: TLG_UNIFIED_MEMORY: a command processor read of guest memory (WAIT_REG_MEM).
+    void SyncUnifiedRead(VAddr address, u64 size);
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
         scheduler.WaitDeferredSignals();

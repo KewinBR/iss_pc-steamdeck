@@ -168,6 +168,9 @@ void Liverpool::Process(std::stop_token stoken) {
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
 
+                if (curr_qid != GfxQueueId) {
+                    asc_submits.fetch_sub(1, std::memory_order_relaxed);
+                }
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
                 submit_cv.notify_all();
@@ -272,6 +275,10 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
     rasterizer.ProcessDownloadImages();
     rasterizer.EagerCopyAtFence();
+    // tlg: TLG_UNIFIED_MEMORY: written when the GPU has finished the work before it.
+    if (rasterizer.DeferUnifiedFence([eop] { SignalEop(eop); })) {
+        return;
+    }
     // Guest memory copies on the copy threads precede the fence the guest sees.
     // TLG_ASYNC_FENCES=1 writes it once they are done instead of waiting for them; measured
     // slower (79 vs 83 FPS): the guest waits on these fences, and later fences stall it more
@@ -408,13 +415,20 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();
     rasterizer.ProcessDownloadImages();
-    event_eos.SignalFence([](void* address, u64 value, u32 num_bytes) {
+    const auto write_eos = [](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         TlgWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, TlgWriteLog::Fence);
         if (!memory->TryWriteBacking(address, &value, num_bytes)) {
             memcpy(address, &value, num_bytes);
         }
-    });
+    };
+    // tlg: TLG_UNIFIED_MEMORY: written when the GPU has finished the work before it.
+    if (event_eos.command != PM4CmdEventWriteEos::Command::GdsStore &&
+        rasterizer.DeferUnifiedFence(
+            [eos = event_eos, write_eos] { eos.SignalFence(write_eos); })) {
+        return;
+    }
+    event_eos.SignalFence(write_eos);
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
         ASSERT(event_eos.size == 1);
         rasterizer.Finish();
@@ -840,8 +854,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    // tlg: TLG_COMPUTE_FAIRNESS=N (0 off): the PS4 runs its compute queues alongside graphics,
+    // and the guest reads their results (inFAMOUS' particle counts) early. Here a compute
+    // submission was recorded only when the graphics queue blocked, behind all the graphics before
+    // it in the one Vulkan queue. Every N graphics packets, with compute work queued, the graphics
+    // queue gives way to it. From the weshayoub92 shadPS4 fork (asc_yield_packets, 153a5aa7), on
+    // with 16 in the Castlesea port (ISS_COMPUTE_FAIRNESS).
+    static const u32 fairness_packets = [] {
+        const char* env = std::getenv("TLG_COMPUTE_FAIRNESS");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
     while (!dcb.empty()) {
         ProcessCommands();
+        if (fairness_packets != 0 && asc_submits.load(std::memory_order_relaxed) != 0 &&
+            ++gfx_packets_since_yield >= fairness_packets) {
+            gfx_packets_since_yield = 0;
+            YIELD_GFX();
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -1409,6 +1438,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                wait_reg_mem->TestValue(value)) {
                     break;
                 }
+                // tlg: TLG_UNIFIED_MEMORY: memory the GPU writes in place is read once the GPU
+                // writes recorded before this wait are done.
+                if (rasterizer &&
+                    wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+                    rasterizer->SyncUnifiedRead(wait_reg_mem->Address<VAddr>(), sizeof(u32));
+                }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
                 while (!wait_reg_mem->Test(regs.reg_array)) {
@@ -1946,6 +1981,8 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     const auto vqid = gnm_vqid - 1;
     const auto& task = ProcessCompute(acb, vqid);
+    // Counted before the command processor can see (and complete) the submission.
+    asc_submits.fetch_add(1, std::memory_order_relaxed);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

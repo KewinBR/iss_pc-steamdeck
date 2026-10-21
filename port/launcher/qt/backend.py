@@ -500,6 +500,9 @@ class Backend(QObject):
             QTimer.singleShot(CLOSE_DELAY_MS, self._quit_app)
 
     def _quit_app(self):
+        process = self.process
+        if self.settings.get('reopen_launcher', True) and process is not None and process.poll() is None:
+            tlg_run.reopen_after(process.pid)
         app = QCoreApplication.instance()
         if app is None:
             return

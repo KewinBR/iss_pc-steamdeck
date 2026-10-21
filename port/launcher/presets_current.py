@@ -37,6 +37,10 @@ CURRENT = {
         'BP07': '1',
         'BP08': '1',
         'TLG_BARRIER_MERGE': '0',
+        # this port's renderer (presets_v2.py has the renderer v2 ones): listed so that applying this
+        # preset after RENDERER V2 brings the renderer back
+        'TLG_RENDERER': '1',
+        'TLG_NATIVE_PASSES': '0',
     },
     # in the export for reference, never applied
     'not_applied': {

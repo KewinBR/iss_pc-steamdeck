@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 
+import addons
 import backports_table
 import logtail
 import shader_cache
@@ -87,7 +88,37 @@ def __getattr__(name):  # old code that still reads tlg_run.USER_DIR gets the cu
 
 LOG_DIR = OUT_DIR / 'logs'
 PROBE = OUT_DIR / ('tlg-probe.exe' if os.name == 'nt' else 'tlg-probe')
+# TLG_PROBE (ISS_PROBE): another probe build next to it, e.g. tlg-probe-v2 (renderer v2).
+if os.environ.get('TLG_PROBE') or os.environ.get('ISS_PROBE'):
+    PROBE = OUT_DIR / Path(os.environ.get('TLG_PROBE') or os.environ['ISS_PROBE']).name
+# Renderer v2 (port/gpu_v2, the launcher's "Renderer" choice): its probe and its own defaults.
+V2_PROBE = OUT_DIR / ('tlg-probe-v2.exe' if os.name == 'nt' else 'tlg-probe-v2')
+V2_DEFAULTS = PORT_DIR / 'gpu_v2' / 'defaults.env'
 KEEP_LOGS = 30
+
+
+def renderer_v2(settings):
+    """True when the player chose renderer v2 and it is built (else this port's renderer)."""
+    item = next(i for i in backports_table.ITEMS if i.key == 'renderer')
+    return backports_table.effective(item, experimental_states(settings)) == '2' and V2_PROBE.is_file()
+
+
+def renderer_v2_env(settings):
+    """Its launcher's defaults (gpu_v2/defaults.env), the game folder its shader index reads, and the
+    native passes as the launcher's switch says (off by default)."""
+    env = {}
+    try:
+        for line in V2_DEFAULTS.read_text(encoding='utf-8').splitlines():
+            key, sep, value = line.strip().partition('=')
+            if sep and key and not key.startswith('#'):
+                env[key] = value
+    except OSError:
+        pass
+    env['ISS_GAME_DIR'] = settings['game_dir']
+    # Native passes: the launcher's "Native passes" switch (off by default: NVIDIA's Linux driver).
+    item = next(i for i in backports_table.ITEMS if i.key == 'native_passes')
+    env['ISS_NATIVE_PASSES'] = '1' if backports_table.effective(item, experimental_states(settings)) == '1' else '0'
+    return env
 
 # Game language: PS4 system language ids (sceSystemServiceParamGetInt LANG). Which of them the
 # player's dump has comes from its PlayGo chunks (game_languages); each choice passes its own id.
@@ -242,7 +273,8 @@ DEFAULT_SETTINGS = {
     'write_merge': True,     # ISS_WRITE_MERGE: game memcpy/memset into GPU memory without a GPU wait
     'deferred_readback': True,  # ISS_DEFERRED_READBACK: the game thread waits for its own GPU reads
     'precompile_shaders': True,  # launcher: make the shader jobs list before the game starts (precompile.py)
-    'close_on_play': True,  # launcher: close about 2 s after the game starts (an open launcher cost ~30% FPS in CPU-bound scenes)
+    'close_on_play': True,
+    'reopen_launcher': True,  # launcher closed on play: opens again when the game exits  # launcher: close about 2 s after the game starts (an open launcher cost ~30% FPS in CPU-bound scenes)
     'gpu_readbacks': '2',    # 2 precise: GPU particles (smoke to drain) need it; 0 fast skips them
 }
 
@@ -698,6 +730,9 @@ def build_env(settings, extra=None):
     if settings.get('ui_language', 'auto') != 'auto':
         env['ISS_UI_LANG'] = settings['ui_language']
     env['ISS_CONFIG'] = str(user_dir() / 'tlg.ini')
+    dlc = addons.labels(user_dir() / 'dlc')
+    if dlc:
+        env.setdefault('ISS_ADDCONT_LABELS', ','.join(dlc))
     # Window name, app id (matches infamous-pc.desktop for Alt+Tab and the dock) and icon.
     env.setdefault('ISS_APP_NAME', 'inFAMOUS Second Son')
     env.setdefault('ISS_APP_ID', 'infamous-pc')
@@ -722,6 +757,10 @@ def build_env(settings, extra=None):
     # Experimental fixes (BPnn) and A/B switches the player changed: ISS_<name>=0/1 (the probe
     # copies them to TLG_). Untouched ones add nothing; ISS_/TLG_ set outside the launcher win.
     env.update(backports_table.environment(experimental_states(settings), os.environ))
+    if renderer_v2(settings):
+        for key, value in renderer_v2_env(settings).items():
+            if key not in os.environ:
+                env[key] = value
     if extra:
         env.update(extra)
     return env
@@ -786,6 +825,62 @@ def detach_options():
     return {'start_new_session': True}
 
 
+def wait_for_exit(pid):
+    """Blocks until process pid ends (no window, no Qt: a closed launcher's watcher)."""
+    if os.name == 'nt':
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.OpenProcess(0x00100000, False, int(pid))   # SYNCHRONIZE
+        if handle:
+            kernel.WaitForSingleObject(handle, 0xFFFFFFFF)
+            kernel.CloseHandle(handle)
+        return
+    while True:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        try:   # a zombie (exited, not yet reaped) counts as ended
+            if Path(f'/proc/{int(pid)}/stat').read_text().split(') ', 1)[1][:1] == 'Z':
+                return
+        except (OSError, IndexError):
+            pass
+        time.sleep(1.0)
+
+
+def reopen_after(pid):
+    """Starts a detached watcher that opens the launcher again once the game (pid) exits."""
+    if FROZEN:
+        cmd = [sys.executable, '--reopen-after', str(pid)]
+    else:
+        cmd = [sys.executable, str(Path(__file__).resolve().parent / 'infamous_launcher_qt.py'),
+               '--reopen-after', str(pid)]
+    try:
+        subprocess.Popen(cmd, env=desktop_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, **detach_options())
+        return True
+    except OSError:
+        return False
+
+
+def raise_open_file_limit():
+    """Linux: lifts the open-file limit to its hard maximum; the game inherits it. A desktop session
+    starts programs with a soft limit of 1024 (systemd DefaultLimitNOFILESoft), and renderer v2
+    goes past it while it preloads the pipelines: SDL then fails to create the window's buffer
+    file ("Too many open files") and the game crashes before its window opens."""
+    if os.name == 'nt':
+        return
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
 def launch(settings, seconds=0, extra_env=None):
     """Writes the in-game settings, starts the game; returns (process, log path).
     The game writes stdout and stderr straight into the log file (no pipe, nobody reads it while
@@ -802,11 +897,15 @@ def launch(settings, seconds=0, extra_env=None):
     note = savemanager.backup_before_play(data)   # saves copied aside before every start (and to the extra folder)
     if note:
         print(note, flush=True)
-    cmd = [str(PROBE), str(OUT_DIR / 'boot-linked.bin'), '--app0', settings['game_dir'],
+    probe = V2_PROBE if renderer_v2(settings) else PROBE
+    if probe == V2_PROBE:
+        print('Renderer v2 (port/gpu_v2)', flush=True)
+    cmd = [str(probe), str(OUT_DIR / 'boot-linked.bin'), '--app0', settings['game_dir'],
            '--user', str(data), '--content-profile', str(OUT_DIR / 'content.bin'),
            '--patches', str(OUT_DIR / 'patches.bin'), '--timeout', str(int(seconds))]
     if ISA_TABLE.is_file():
         cmd += ['--isa-rewrite', str(ISA_TABLE)]
+    raise_open_file_limit()
     with open(log, 'wb') as out:   # the child keeps its own copy of the descriptor
         process = subprocess.Popen(cmd, cwd=str(data), env=build_env(settings, extra_env),
                                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,

@@ -144,6 +144,19 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// tlg: TLG_UNIFIED_MEMORY (unified_memory.h): the range is in the imported guest memory.
+    [[nodiscard]] bool IsUnified(VAddr addr, u64 size) const noexcept {
+        return addr >= unified_base && addr + size <= unified_end;
+    }
+    /// tlg: the range is imported (EnableUnified succeeded).
+    [[nodiscard]] bool UnifiedActive() const noexcept {
+        return unified_end != 0;
+    }
+    /// tlg: GPU writes to the range recorded and not known to be complete.
+    [[nodiscard]] bool UnifiedTouched(VAddr addr, u64 size);
+    /// tlg: a command processor read of the range: waits for the GPU writes recorded before it.
+    void SyncUnifiedRead(VAddr addr, u64 size);
+
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
 
@@ -168,6 +181,10 @@ private:
     }
 
     const Buffer* GetArena(u64 first_block, u64 last_block);
+
+    /// tlg: TLG_UNIFIED_MEMORY: imports the range at its first binding (false: not yet / failed).
+    bool EnableUnified();
+    std::pair<const Buffer*, u64> ObtainUnified(VAddr device_addr, u32 size, bool is_written);
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
@@ -373,6 +390,16 @@ private:
     vk::DeviceMemory residency_chunk{};
     u64 residency_chunk_used{};
     u64 residency_allocations{};
+
+    // tlg: TLG_UNIFIED_MEMORY (unified_memory.h).
+    static constexpr u32 UNIFIED_CHUNK_SHIFT = 16;
+    VAddr unified_base{};
+    VAddr unified_end{};
+    bool unified_failed{};
+    vk::DeviceMemory unified_memory{};
+    std::unique_ptr<Buffer> unified_buffer;
+    /// GPU tick of the last recorded write of each 64 KiB chunk.
+    std::unique_ptr<std::atomic<u64>[]> unified_chunk_tick;
 
     u32 arena_memory_type_index{};
     u32 block_size{};

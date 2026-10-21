@@ -56,6 +56,8 @@
   "gfx_what_gpu_readbacks": {"en": "How exactly the GPU results the game reads back are copied. Precise is needed for GPU particles (smoke); Fast skips them.", "pt": "Quão exatos são os resultados da GPU que o jogo lê de volta. Preciso é necessário para as partículas da GPU (fumaça); Rápido as pula."},
   "gfx_what_eager_readback": {"en": "Copies GPU results the game reads back at each fence, ahead of time.", "pt": "Copia, a cada fence, os resultados da GPU que o jogo vai ler, antes de ele pedir."},
   "close_on_play": {"en": "Close the launcher when the game starts", "pt": "Fechar o launcher ao abrir o jogo"},
+  "reopen_launcher": {"en": "Open the launcher again when the game closes", "pt": "Abrir o launcher de novo ao fechar o jogo"},
+  "gfx_what_reopen_launcher": {"en": "With the launcher closed on play, it comes back when you quit the game. Nothing stays open while you play: a small waiting process only.", "pt": "Com o launcher fechado ao jogar, ele volta quando você sai do jogo. Nada fica aberto enquanto você joga: só um pequeno processo esperando."},
   "gfx_what_close_on_play": {"en": "The launcher closes about 2 seconds after the game starts. The game keeps running on its own either way; with the launcher open you can follow its log.", "pt": "O launcher fecha cerca de 2 segundos depois que o jogo abre. O jogo continua rodando sozinho de qualquer jeito; com o launcher aberto você acompanha o log."},
   "gfx_what_precompile_shaders": {"en": "On the first start (and after a game update) the launcher prepares a list of shaders in about a minute, and the game compiles them behind a loading screen. Off: nothing is prepared, the list is deleted and shaders compile while you play.", "pt": "Na primeira abertura (e depois de atualizar o jogo) o launcher prepara uma lista de shaders em cerca de um minuto e o jogo os compila atrás de uma tela de carregamento. Desligado: nada é preparado, a lista é apagada e os shaders compilam durante a partida."},
   "gfx_what_write_merge": {"en": "The game's writes into GPU memory no longer wait for the GPU.", "pt": "As escritas do jogo na memória da GPU deixam de esperar a GPU."},
@@ -491,5 +493,9 @@
   "adv_nothing": {"en": "Nothing found.", "pt": "Nada encontrado."},
   "adv_auto": {"en": "automatic", "pt": "automático"},
   "adv_profile_default": {"en": "All defaults", "pt": "Tudo no padrão"},
-  "adv_profile_custom": {"en": "{n} changed", "pt": "{n} alterado(s)"}
+  "adv_profile_custom": {"en": "{n} changed", "pt": "{n} alterado(s)"},
+  "gfx_preset_renderer_v2": {"en": "RENDERER V2", "pt": "RENDERER V2"},
+  "gfx_preset_renderer_v2_what": {"en": "The recommended setup on renderer v2 (experimental): its own shader cache, compiled again on the first start. Native passes stay off (NVIDIA driver crash).", "pt": "A configuração recomendada no renderer v2 (experimental): cache de shaders próprio, compilado de novo na primeira partida. Os native passes ficam desligados (crash no driver NVIDIA)."},
+  "gfx_preset_renderer_v2_native": {"en": "RENDERER V2 + NATIVE PASSES", "pt": "RENDERER V2 + NATIVE PASSES"},
+  "gfx_preset_renderer_v2_native_what": {"en": "RENDERER V2 with its native passes on (for tests): more frames in some places, but on NVIDIA's Linux driver frame drops and crashes.", "pt": "RENDERER V2 com os native passes ligados (para testes): mais quadros em alguns lugares, mas no driver NVIDIA do Linux quedas de quadros e travamentos."}
 }

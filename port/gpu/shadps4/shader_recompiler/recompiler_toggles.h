@@ -30,6 +30,10 @@ inline bool AlwaysOn() {
 /// inFAMOUS Second Son (CUSA00223 EU/US disc, CUSA00004 US digital): the LDS barrier fixes are
 /// aimed at its GPU particle smoke (iss_pc #7) and stay off for the other games until tested.
 inline bool InfamousDefault() {
+    // No game loaded (the GPU library tests, tools): not inFAMOUS.
+    if (!Common::ElfInfo::Instance().IsInitialized()) {
+        return false;
+    }
     const std::string_view serial = Common::ElfInfo::Instance().GameSerial();
     return serial == "CUSA00223" || serial == "CUSA00004";
 }

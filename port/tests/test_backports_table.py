@@ -12,7 +12,7 @@ import infamous_run  # noqa: E402,F401
 
 HEADER = ROOT / 'gpu' / 'shadps4' / 'common' / 'backports.h'
 TOGGLES = ROOT / 'gpu' / 'shadps4' / 'shader_recompiler' / 'recompiler_toggles.h'
-SOURCE_DIRS = ('gpu', 'src')
+SOURCE_DIRS = ('gpu', 'gpu_v2', 'src')
 
 
 def header_entries():

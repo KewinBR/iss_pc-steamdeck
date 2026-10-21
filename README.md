@@ -201,6 +201,8 @@ A tela **Correções** do launcher (e o botão **Correções experimentais…** 
 - **Como a release anterior:** `TLG_BACKPORTS=0` (ou o botão do launcher) desliga todas as BP que vêm ligadas, para comparar com a versão sem elas; um `TLG_BPnn` individual ainda vence. Na primeira abertura depois de atualizar, uma mensagem única explica isso. Se uma cena piorar, teste primeiro assim e depois ligue uma a uma.
 - **Voltar ao recomendado** apaga todas as suas escolhas. Só o que difere do padrão é gravado.
 - **Chaves de diagnóstico (A/B):** `ISS_WQM`, `ISS_LDS_SMALL`, `ISS_LDS_MULTI`, `ISS_LDS_READLANE`, `ISS_LANE_DIVERGENCE`, `ISS_RFL_ALL`, `ISS_BLOCK1D`, `ISS_BC_TINY`, `ISS_NO_MSAA`, `ISS_BACKGROUND_WARMUP`, `ISS_PIPELINE_BINARIES` (ainda derruba o jogo no driver NVIDIA 595) e o seletor de oclusão (`ISS_OCCLUSION_MODE`); `0` desliga, `1` liga. Servem para descobrir qual mudança causa um problema.
+- **Fumaça da GPU sem piscar (#7, #50):** `ISS_DYNAMIC_STRIDE` (ligado; `0` desliga) faz os shaders de compute lerem o stride de cada buffer do descritor da GPU em vez de compilá-lo, então um shader compilado serve para todos os strides: a fumaça parou de piscar e a primeira compilação ficou 30% menor (17.822 → 12.490 shaders).
+- **Em teste:** `ISS_PRESENT_ACQUIRE_FENCE` (ligado; `0` desliga) faz a thread de apresentação esperar a imagem da tela antes de enviar o quadro, para não segurar a fila da GPU com o VSync ligado. Veio do port do [Castlesea](https://github.com/Castlesea/infamous-second-son-pc-port).
 - O BP08 (cache de pipelines do driver em disco) vem ligado desde 16/10: a criação de pipelines fica rápida o bastante para nenhum desenho ser pulado (os flashes cinza de um quadro). O arquivo é salvo só quando há pipelines novos e não passa de 1 GB (`ISS_DRIVER_CACHE_MAX_MB`; apagar o arquivo recomeça). O resto do engasgo de shader está no [roadmap](docs/ROADMAP.md).
 - Tabela completa, com as chaves do `tlg.ini` e as opções do menu Insert: [`docs/EXPERIMENTAL_FIXES.md`](docs/EXPERIMENTAL_FIXES.md).
 
@@ -292,6 +294,8 @@ Por padrão os saves e as configurações ficam em `user/`, ao lado do jogo. **A
 4. Se você já extraiu a versão nova e o save sumiu, a tela acha as outras instalações (Downloads, Área de Trabalho, Documentos, pastas vizinhas...) e oferece **Importar**.
 
 **Onde fica a pasta de dados**, nesta ordem: a variável `ISS_USER_DIR`; o arquivo-ponteiro do usuário (`%APPDATA%\inFAMOUS-PC\launcher.json` no Windows, `~/.config/infamous-pc/launcher.json` no Linux); e, sem nenhum dos dois, `user/` ao lado do jogo (modo portátil). A mesma pasta guarda `tlg.ini`, saves, backups e o cache de shaders.
+
+**DLC (trajes, Cole's Legacy):** o conteúdo já está no jogo base; falta só a licença. Coloque os seus pacotes de DLC (`.pkg`) ou as pastas de DLC do seu dump (com `sce_sys/param.sfo`) em `dlc/`, dentro da pasta de dados. O launcher lê só o rótulo de cada um, não copia nem altera nada, e o jogo passa a vê-los como instalados (`ISS_ADDCONT_LABELS=ROTULO,ROTULO` faz o mesmo à mão).
 
 **Na tela Saves e dados:** um cartão por slot (título, capítulo, karma, data, tamanho e a miniatura do próprio save) com exportar `.zip`, duplicar e excluir; importar `.zip`; backups com **Restaurar**, manter os últimos N (padrão 10) e uma pasta extra de backup (outro disco). **Um backup é feito antes de cada partida** (pulado se nada mudou). Toda operação que escreve num save exige o jogo fechado e faz um backup de segurança antes; um `.zip` inválido ou perigoso (caminhos com `..`, absolutos, links) é recusado sem escrever nada.
 
@@ -396,6 +400,7 @@ Base de código: [tlg_pc](https://github.com/HayatoG/tlg_pc), [gr2_pc](https://g
 ### Agradecimentos
 
 - **Kazu**, pelos logs, capturas de tela e testes, no Windows e no Linux, que levaram à correção dos faróis que piscavam e do brilho que atravessava os personagens (o modo de oclusão 3).
+- **[Castlesea](https://github.com/Castlesea/infamous-second-son-pc-port)**, autor de outro port nativo do inFAMOUS Second Son (GPL-2.0), de onde vieram o stride dinâmico dos shaders de compute, a espera pela imagem da tela no present e o DLC pelos pacotes do jogador.
 - Aos jogadores que reportaram problemas nas [issues](https://github.com/HayatoG/iss_pc/issues), com logs que mudaram o rumo do port: jacckkss (#50, luzes e fumaça piscando), heyzerr (#51, #65, #67, CPUs sem F16C e RX 580), Andrade2244 (#29), MrRobot11214 (#31), fghacksr (#49), AngelHomura (#59) e aledieb93-svg (#81) (crashes na RX 580 e no Windows), ViniSnapeS (#72) e kudetgaming-art (#75) (memória de vídeo), summer882 (#71), manymanyyyd-afk (#63) e Kpopping (#73) (idiomas turco e russo), mahmoudmahran2112-crypto (#70, Quadro/Maxwell), Milicksp (#16), gsev3333 (#41) e todos os outros que abriram uma issue ou testaram uma versão.
 
 Este projeto não tem vínculo com a Sony Interactive Entertainment ou a Sucker Punch Productions. inFAMOUS é marca da Sony Interactive Entertainment. Nenhum código, arquivo ou arte do jogo é distribuído aqui. O ícone é uma arte original do projeto.
@@ -567,6 +572,8 @@ The launcher's **Fixes** screen (and the **Experimental fixes…** button of the
 - **Like the previous release:** `TLG_BACKPORTS=0` (or the launcher button) turns off every BP that is on by default, to compare with the version without them; an individual `TLG_BPnn` still wins. On the first start after updating, a one-time message explains this. If a scene gets worse, test this way first, then turn them back on one by one.
 - **Back to recommended** clears all your choices. Only what differs from the default is written.
 - **Diagnostic (A/B) switches:** `ISS_WQM`, `ISS_LDS_SMALL`, `ISS_LDS_MULTI`, `ISS_LDS_READLANE`, `ISS_LANE_DIVERGENCE`, `ISS_RFL_ALL`, `ISS_BLOCK1D`, `ISS_BC_TINY`, `ISS_NO_MSAA`, `ISS_BACKGROUND_WARMUP`, `ISS_PIPELINE_BINARIES` (still crashes the game on the NVIDIA 595 driver) and the occlusion selector (`ISS_OCCLUSION_MODE`); `0` turns off, `1` turns on. They exist to find which change causes a problem.
+- **GPU smoke no longer flickers (#7, #50):** `ISS_DYNAMIC_STRIDE` (on; `0` turns it off) makes compute shaders read each buffer's stride from the GPU descriptor instead of compiling it in, so one compiled shader serves every stride: the smoke stopped flickering and the first-run compile got 30% smaller (17,822 → 12,490 shaders).
+- **Being tested:** `ISS_PRESENT_ACQUIRE_FENCE` (on; `0` turns it off) makes the present thread wait for the screen's image before submitting the frame, so it does not hold the GPU queue with VSync on. It comes from [Castlesea](https://github.com/Castlesea/infamous-second-son-pc-port)'s port.
 - BP08 (the on-disk driver pipeline cache) is on since 2026-10-16: pipeline creation gets fast enough that no draw is skipped (the grey one-frame flashes). The file is saved only when there are new pipelines and never grows past 1 GB (`ISS_DRIVER_CACHE_MAX_MB`; deleting it starts over). The rest of the shader stutter is on the [roadmap](docs/ROADMAP.md).
 - Full table, with the `tlg.ini` keys and the Insert menu options: [`docs/EXPERIMENTAL_FIXES.md`](docs/EXPERIMENTAL_FIXES.md).
 
@@ -658,6 +665,8 @@ By default saves and settings live in `user/`, next to the game. **Updating dele
 4. If you already extracted the new version and the save is gone, the screen finds the other installs (Downloads, Desktop, Documents, neighbor folders...) and offers **Import**.
 
 **Where the data folder is**, in this order: the `ISS_USER_DIR` variable; the per-user pointer file (`%APPDATA%\inFAMOUS-PC\launcher.json` on Windows, `~/.config/infamous-pc/launcher.json` on Linux); and, with neither, `user/` next to the game (portable mode). The same folder holds `tlg.ini`, saves, backups and the shader cache.
+
+**DLC (costumes, Cole's Legacy):** the content is already in the base game; only the license is missing. Put your own DLC packages (`.pkg`) or the DLC folders of your dump (with `sce_sys/param.sfo`) in `dlc/`, inside the data folder. The launcher reads only each one's label, copies and changes nothing, and the game sees them as installed (`ISS_ADDCONT_LABELS=LABEL,LABEL` does the same by hand).
 
 **On the Saves & data screen:** one card per slot (title, chapter, karma, date, size and the save's own thumbnail) with `.zip` export, duplicate and delete; `.zip` import; backups with **Restore**, keeping the last N (default 10) and an extra backup folder (another disk). **A backup is made before every play session** (skipped if nothing changed). Every operation that writes to a save needs the game closed and makes a safety backup first; an invalid or dangerous `.zip` (paths with `..`, absolute paths, links) is refused without writing anything.
 
@@ -762,6 +771,7 @@ Code base: [tlg_pc](https://github.com/HayatoG/tlg_pc), [gr2_pc](https://github.
 ### Acknowledgements
 
 - **Kazu**, for the logs, screenshots and tests, on Windows and on Linux, that led to the fix for the flickering headlights and the glare showing through characters (occlusion mode 3).
+- **[Castlesea](https://github.com/Castlesea/infamous-second-son-pc-port)**, author of another native inFAMOUS Second Son port (GPL-2.0), where the dynamic stride of compute shaders, the present's wait for the screen's image and DLC from the player's packages came from.
 - The players who reported problems in the [issues](https://github.com/HayatoG/iss_pc/issues), with logs that changed the port's course: jacckkss (#50, flickering lights and smoke), heyzerr (#51, #65, #67, CPUs without F16C and the RX 580), Andrade2244 (#29), MrRobot11214 (#31), fghacksr (#49), AngelHomura (#59) and aledieb93-svg (#81) (crashes on the RX 580 and on Windows), ViniSnapeS (#72) and kudetgaming-art (#75) (video memory), summer882 (#71), manymanyyyd-afk (#63) and Kpopping (#73) (Turkish and Russian), mahmoudmahran2112-crypto (#70, Quadro/Maxwell), Milicksp (#16), gsev3333 (#41) and everyone else who opened an issue or tested a build.
 
 This project is not affiliated with Sony Interactive Entertainment or Sucker Punch Productions. inFAMOUS is a trademark of Sony Interactive Entertainment. No game code, files or art are distributed here. The icon is original artwork made for this project.

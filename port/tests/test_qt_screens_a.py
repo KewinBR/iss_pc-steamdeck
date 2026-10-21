@@ -255,7 +255,7 @@ VkPhysicalDeviceMemoryProperties:
                 item = gfxlogic.item_by_id(item_id)
                 self.assertIn(value, [item.default] + [c[0] for c in item.choices] + ['0', '1'], item_id)
         self.assertEqual(('rec1', 'current', 'amd', 'rx580', 'seco', 'apolar_amd', 'apolar_rtx', 'apolar_gtx',
-                          'performance', 'balanced', 'quality', 'ps4'),
+                          'renderer_v2', 'renderer_v2_native', 'performance', 'balanced', 'quality', 'ps4'),
                          tuple(p[0] for p in gfxlogic.PRESETS))
 
     def test_apolar_profiles_are_complete_and_credit_the_contributor(self):

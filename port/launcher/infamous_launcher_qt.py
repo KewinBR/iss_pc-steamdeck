@@ -21,6 +21,10 @@ def main():
     if args[:1] in (['--apply-update'], ['--rollback-update']) and len(args) == 3:
         import update_install
         sys.exit(update_install.helper(args[1], int(args[2]), rollback=args[0] == '--rollback-update'))
+    # --reopen-after PID: the launcher closed on play waits (no window) for the game, then opens again.
+    if args[:1] == ['--reopen-after'] and len(args) == 2 and args[1].isdigit():
+        tlg_run.wait_for_exit(int(args[1]))
+        args = []
     # Same packaged roles as the Tk launcher: preparation scripts and a window-less --play.
     if args[:1] == ['--script'] and len(args) > 1:
         sys.exit(tlg_run.run_script(args[1:]))

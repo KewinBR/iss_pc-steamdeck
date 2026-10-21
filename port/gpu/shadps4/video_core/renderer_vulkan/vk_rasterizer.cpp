@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_depth_stencil_state.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_occlusion.h"
+#include "video_core/buffer_cache/unified_memory.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -4155,6 +4156,41 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .size = num_bytes,
     };
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
+}
+
+bool Rasterizer::DeferUnifiedFence(Common::UniqueFunction<void>&& write) {
+    if (!buffer_cache.UnifiedActive()) {
+        return false;
+    }
+    // Every fence, not only those in the range: labels stay in order (a later fence written
+    // first lets the guest free memory an earlier one still writes into).
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        const vk::MemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        });
+    });
+    scheduler.DeferPriorityOperation(std::move(write));
+    scheduler.Flush();
+    VideoCore::Unified::Add(VideoCore::Unified::FencesDeferred);
+    VideoCore::Unified::MaybeReport(static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()));
+    return true;
+}
+
+void Rasterizer::SyncUnifiedRead(VAddr address, u64 size) {
+    if (!buffer_cache.UnifiedActive() || !buffer_cache.IsUnified(address, size)) {
+        return;
+    }
+    DrainDrawPipe();
+    buffer_cache.SyncUnifiedRead(address, size);
 }
 
 void Rasterizer::WriteHiddenOcclusion(VAddr address, u32 num_pairs) {

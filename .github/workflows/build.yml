@@ -51,7 +51,8 @@ jobs:
             libxxhash-dev zlib1g-dev libx11-dev libxcb1-dev libxext-dev libxrandr-dev libxcursor-dev \
             libxi-dev libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev wayland-protocols \
             libdecor-0-dev libegl-dev libgl-dev libdrm-dev libgbm-dev libpulse-dev libasound2-dev \
-            libpipewire-0.3-dev libudev-dev libdbus-1-dev libusb-1.0-0-dev libfreetype-dev
+            libpipewire-0.3-dev libudev-dev libdbus-1-dev libusb-1.0-0-dev libfreetype-dev \
+            clang libssl-dev
       - name: Cache built libraries
         id: deps
         uses: actions/cache@v4
@@ -73,7 +74,8 @@ jobs:
           done) &
           progress_pid=$!
           trap 'kill "$progress_pid" 2>/dev/null || true' EXIT
-          TLG_LTO=ON TLG_PGO=off bash build.sh
+          # TLG_RENDERER_V2=1: renderer v2 too (port/gpu_v2, out/tlg-probe-v2), shipped in the package.
+          TLG_RENDERER_V2=1 TLG_LTO=ON TLG_PGO=off bash build.sh
       # The unit tests need no GPU, display or game file. Each test step runs even when an earlier
       # one failed (all failures show in one run); any failure fails the job before Package.
       - name: C tests
@@ -170,7 +172,8 @@ jobs:
           done) &
           progress_pid=$!
           trap 'kill "$progress_pid" 2>/dev/null || true' EXIT
-          TLG_LTO=ON bash build.sh
+          # TLG_RENDERER_V2=1: renderer v2 too (port/gpu_v2, out/tlg-probe-v2.exe), shipped in the package.
+          TLG_RENDERER_V2=1 TLG_LTO=ON bash build.sh
       - name: Package
         env:
           MSYS2_ROOT: ${{ runner.temp }}/msys64
