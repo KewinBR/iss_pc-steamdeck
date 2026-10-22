@@ -317,21 +317,36 @@ static int unified_wanted(uintptr_t address, uint64_t size) {
             if (end && *end==':') span=strtoull(end+1,NULL,0);
         }
     }
-    return on && unified_fd<0 && address==base && size==span;
+    /* steam-deck: span pode ser maior que o mapeamento em base (heap B + heap C, contiguos na memoria fisica). */
+    return on && unified_fd<0 && address==base && size<=span;
+}
+static uint64_t unified_span(void) {
+    const char *r=getenv("ISS_UNIFIED_RANGE"), *c=r ? strchr(r,':') : NULL;
+    return c ? strtoull(c+1,NULL,0) : 0x20000000ull;
 }
 static int in_unified(uint64_t phys, uint64_t size) {
     return unified_fd>=0 && phys>=unified_phys && phys+size<=unified_phys+unified_size;
 }
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
     if (!reserved && unified_wanted(address,size)) {
-        int fd=tlggpu_unified_alloc(size);
-        if (fd>=0 && mmap(backing_base+phys,size,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0)!=MAP_FAILED) {
-            unified_fd=fd; unified_phys=phys; unified_size=size;
-            fprintf(stderr,"Runtime: unified heap 0x%" PRIxPTR " (%" PRIu64 " MB) on a dma-buf\n",address,size>>20);
+        uint64_t span=unified_span();
+        if (span<size || phys+span>POOL_SIZE) span=size;
+        int fd=tlggpu_unified_alloc(span);
+        if (fd>=0 && mmap(backing_base+phys,span,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0)!=MAP_FAILED) {
+            unified_fd=fd; unified_phys=phys; unified_size=span;
+            fprintf(stderr,"Runtime: unified heap 0x%" PRIxPTR " (%" PRIu64 " MB, phys 0x%" PRIx64 ", dma-buf %" PRIu64 " MB) on a dma-buf\n",
+                    address,size>>20,phys,span>>20);
         } else {
             fprintf(stderr,"Runtime: unified heap dma-buf failed (fd %d); memfd as before\n",fd);
         }
     }
+    if (!reserved && unified_fd>=0 && !in_unified(phys,size) &&
+        phys<unified_phys+unified_size && phys+size>unified_phys)
+        fprintf(stderr,"Runtime: AVISO mapeamento 0x%" PRIxPTR " phys 0x%" PRIx64 " cruza o heap unificado sem caber nele\n",
+                address,phys);
+    if (!reserved && in_unified(phys,size) && phys!=unified_phys)
+        fprintf(stderr,"Runtime: 0x%" PRIxPTR " (%" PRIu64 " MB, phys 0x%" PRIx64 ") tambem no heap unificado\n",
+                address,size>>20,phys);
     void *mapped = !reserved
         ? (in_unified(phys,size)
                ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,unified_fd,(off_t)(phys-unified_phys))
