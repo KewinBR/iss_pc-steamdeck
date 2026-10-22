@@ -553,6 +553,9 @@ private:
     /// Image::tick_accessed_last of an image used since a given gc tick is at least.
     std::array<u64, 256> gc_scheduler_ticks{};
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
+    /// steam-deck: protege lru_cache e lru_touched. TouchImage roda sem o mutex do cache (GetImage, UpdateImage) e
+    /// de mais de uma thread; o GC segura este lock durante a varredura (recursivo: o FreeImage dele mexe na LRU).
+    std::recursive_mutex lru_lock;
     /// TouchImage: gc_tick + 1 of the last touch of each LRU entry (a dense array read instead
     /// of the LRU item, which already holds that tick).
     std::vector<u64> lru_touched;

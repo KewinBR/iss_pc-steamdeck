@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdio>
 #include <deque>
 #include <type_traits>
 
@@ -58,7 +59,20 @@ public:
         static constexpr bool RETURNS_BOOL =
             std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
         Item* iterator = first_item;
+        // steam-deck: uma lista corrompida (item ligado duas vezes) vira um ciclo e o laco nunca termina (o GpuComm
+        // travou aqui). Mais passos do que itens existentes so acontece num ciclo: para e avisa.
+        size_t steps = 0;
+        const size_t max_steps = item_pool.size() + 1;
         while (iterator) {
+            if (++steps > max_steps) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    std::fprintf(stderr, "LRU_CYCLE: lista da LRU em ciclo (%zu itens), varredura interrompida\n",
+                                 item_pool.size());
+                }
+                return;
+            }
             if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {
                 return;
             }

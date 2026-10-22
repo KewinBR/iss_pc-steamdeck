@@ -1507,7 +1507,10 @@ void TextureCache::RegisterImage(ImageId image_id) {
     BumpGeneration();
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
-    image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    {
+        std::scoped_lock lru{lru_lock};
+        image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    }
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         page_table[page].push_back(image_id);
         page_image_counts[page].fetch_add(1, std::memory_order_release);
@@ -1533,7 +1536,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
                          image_id.index, (unsigned long long)image.image_uid,
                          (unsigned long long)image.info.guest_address, image.info.size.width,
                          image.info.size.height, vk::to_string(image.info.pixel_format).c_str());
-    lru_cache.Free(image.lru_id);
+    {
+        std::scoped_lock lru{lru_lock};
+        lru_cache.Free(image.lru_id);
+    }
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
@@ -1755,6 +1761,7 @@ void TextureCache::GarbageCollectImages() {
     };
 
     // Try to remove anything old enough and not high priority.
+    std::scoped_lock lru{lru_lock};
     configure(false);
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
@@ -1820,6 +1827,16 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(const Image& image) {
+    // steam-deck: imagem desregistrada (id velho guardado por um caminho nativo) nao tem item na LRU: o lru_id dela
+    // ja esta em free_items, e o Touch religaria esse item na lista (depois ligado de novo ao ser reaproveitado: ciclo).
+    if (False(image.flags & ImageFlagBits::Registered)) {
+        static std::atomic<u64> stale{};
+        const u64 n = stale.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "LRU_STALE_TOUCH: %llu toques em imagem desregistrada\n", (unsigned long long)n);
+        return;
+    }
+    std::scoped_lock lru{lru_lock};
     const size_t id = image.lru_id;
     if (id < lru_touched.size()) {
         if (lru_touched[id] == gc_tick + 1) {
