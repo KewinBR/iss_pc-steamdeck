@@ -36,6 +36,9 @@ void SetLoadingCompile(bool compile);
 /// swapchain's creation until the game's first frame. state: 0 preparing, 1 loading the shader cache, 2 compiling
 /// shaders; `total` 0 hides the bar.
 void SetStartup(bool active);
+/// steam-deck (renderer v2): uma compilacao de pipeline durante o jogo (kind 'g' grafico, 'c' compute), qualquer
+/// thread: vai pro caderno da sessao (TLG_CACA_DIR) e pro contador do modo caca.
+void NoteCompile(char kind, u64 hash);
 void SetStartupProgress(int state, u32 done, u32 total);
 bool StartupActive();
 

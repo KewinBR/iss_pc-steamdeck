@@ -1,3 +1,4 @@
+#include "tlg_overlay.h"
 #include <atomic>
 #include "deep_profile.h"
 #include "gpu_blackbox.h"
@@ -2679,6 +2680,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        TlgOverlay::NoteCompile('g', pipeline_hash); // steam-deck: caderno da sessao
         iss::blackbox::Event(iss::blackbox::Compile, "compila pipeline grafico %llx",
                              (unsigned long long)pipeline_hash);
 
@@ -2771,6 +2773,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline(iss::g4::CpOwner owner)
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(owner_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        TlgOverlay::NoteCompile('c', pipeline_hash); // steam-deck: caderno da sessao
         if (aot && owner == iss::g4::CpOwner::Graphics) aot->NoteMiss(owner_infos[0]->pgm_hash);
         iss::blackbox::Event(iss::blackbox::Compile, "compila pipeline compute %llx",
                              (unsigned long long)pipeline_hash);

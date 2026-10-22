@@ -11,6 +11,9 @@ inline bool Mark(unsigned) { return false; }
 #include "tlg_overlay.h"
 
 #include <algorithm>
+#include <string>
+#include <filesystem>
+#include <deque>
 #include <array>
 #include <atomic>
 #include <cfloat>
@@ -51,6 +54,9 @@ static bool ViewMenu() {
 #include "imgui.h"
 #include "imgui_internal.h" // RegisterUserTexture (save pictures)
 #include "imgui_impl_vulkan.h"
+#ifdef TLG_RENDERER_V2
+#include "video_core/renderdoc.h" // RequestScreenshot (caderno das sessoes)
+#endif
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #ifndef TLG_RENDERER_V2
@@ -1811,6 +1817,141 @@ void Draw() {
 }
 
 } // namespace StartupImpl
+
+// ---- steam-deck: caderno das sessoes de caca aos shaders ----
+namespace CacaImpl {
+
+std::mutex mutex;                    // o arquivo e as listas (present thread, compiladores)
+std::FILE* file = nullptr;
+bool opened = false;
+std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+std::atomic<u32> compiles{0}, marks{0};
+std::atomic<bool> mark_request{false};
+bool l3_down = false, r3_down = false;
+std::deque<std::pair<float, float>> frames;      // (t, ms) dos ultimos 10 s
+std::deque<std::pair<float, std::string>> recent; // (t, "g 0x...") dos ultimos 10 s
+float last_shot = -100.0f, flash_until = 0.0f;
+
+float Now() {
+    return std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
+}
+
+bool Hunt() {
+    static const bool on = [] {
+        const char* p = std::getenv("TLG_MODO_CACA");
+        return p && p[0] == '1';
+    }();
+    return on;
+}
+
+// mutex held
+std::FILE* File() {
+    if (!opened) {
+        opened = true;
+        if (const char* dir = std::getenv("TLG_CACA_DIR"); dir && *dir) {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            file = std::fopen((std::string(dir) + "/caderno.txt").c_str(), "a");
+            if (file) {
+                const std::time_t now = std::time(nullptr);
+                char when[32];
+                std::strftime(when, sizeof(when), "%F %T", std::localtime(&now));
+                std::fprintf(file, "sessao %s%s\n", when, Hunt() ? " (modo caca)" : "");
+                std::fflush(file);
+            }
+        }
+    }
+    return file;
+}
+
+void Shot(const char* why, float t) {
+    VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+    last_shot = t;
+    if (std::FILE* f = File()) {
+        const std::time_t now = std::time(nullptr);
+        char when[16];
+        std::strftime(when, sizeof(when), "%H%M%S", std::localtime(&now));
+        std::fprintf(f, "t=%.1f print (%s, arquivo de captura de ~%s)\n", t, why, when);
+    }
+}
+
+void Compile(char kind, u64 hash) {
+    std::scoped_lock lock{mutex};
+    const float t = Now();
+    ++compiles;
+    flash_until = t + 1.2f;
+    char text[40];
+    std::snprintf(text, sizeof(text), "%c %#llx", kind, (unsigned long long)hash);
+    recent.emplace_back(t, text);
+    while (!recent.empty() && recent.front().first < t - 10.0f) recent.pop_front();
+    if (std::FILE* f = File()) {
+        std::fprintf(f, "t=%.1f compilou %s\n", t, text);
+        std::fflush(f);
+    }
+}
+
+long RssMb() {
+    long pages = 0, rss = 0;
+    if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
+        if (std::fscanf(f, "%ld %ld", &pages, &rss) != 2) rss = 0;
+        std::fclose(f);
+    }
+    return rss * 4 / 1024;
+}
+
+// Present thread, cada quadro (fora da tela de abertura). Devolve o aviso a mostrar (vazio: nenhum).
+std::string Frame(float ms) {
+    if (!std::getenv("TLG_CACA_DIR")) return {};
+    std::scoped_lock lock{mutex};
+    const float t = Now();
+    frames.emplace_back(t, ms);
+    while (!frames.empty() && frames.front().first < t - 10.0f) frames.pop_front();
+    if (ms > 250.0f && ms < 5000.0f) {
+        if (std::FILE* f = File()) std::fprintf(f, "t=%.1f quadro de %.0f ms\n", t, ms);
+        if (t - last_shot > 20.0f) Shot("travada", t);
+        if (file) std::fflush(file);
+    }
+    if (mark_request.exchange(false)) {
+        const u32 n = ++marks;
+        float worst = 0.0f;
+        u32 slow = 0;
+        for (const auto& [ft, fm] : frames) {
+            worst = std::max(worst, fm);
+            slow += fm > 50.0f;
+        }
+        const float span = frames.size() > 1 ? frames.back().first - frames.front().first : 0.0f;
+        if (std::FILE* f = File()) {
+            std::fprintf(f, "t=%.1f MOMENTO #%u: ultimos %.0f s %.1f FPS, pior %.0f ms, %u quadros acima de 50 ms, "
+                            "memoria %ld MB, compilacoes:", t, n, span,
+                         span > 0 ? float(frames.size()) / span : 0.0f, worst, slow, RssMb());
+            for (const auto& [ct, c] : recent) std::fprintf(f, " [%.1f %s]", ct, c.c_str());
+            std::fprintf(f, "\n");
+        }
+        Shot("momento", t);
+        if (file) std::fflush(file);
+        return "Momento #" + std::to_string(n) + " marcado";
+    }
+    return {};
+}
+
+// Modo caca: "SHADERS NOVOS: N" no canto superior direito, amarelo por um instante quando compila.
+void DrawCounter() {
+    if (!Hunt()) return;
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float s = vp->Size.y / 800.0f;
+    ImFont* reg = DeckMenuImpl::font_bold ? DeckMenuImpl::font_bold : ImGui::GetFont();
+    char text[48];
+    std::snprintf(text, sizeof(text), "SHADERS NOVOS: %u", compiles.load());
+    const ImVec2 size = DeckMenuImpl::Measure(reg, 20.0f * s, text);
+    const ImVec2 at(vp->Size.x - size.x - 16.0f * s, 12.0f * s);
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(at.x - 8.0f * s, at.y - 4.0f * s), ImVec2(at.x + size.x + 8.0f * s, at.y + size.y + 4.0f * s),
+                      IM_COL32(14, 15, 18, 170));
+    const bool flash = Now() < flash_until;
+    DeckMenuImpl::Text(dl, reg, 20.0f * s, at, flash ? DeckMenuImpl::Amarelo : DeckMenuImpl::Branco, text);
+}
+
+} // namespace CacaImpl
 #endif
 
 void Menu() {
@@ -3001,6 +3142,16 @@ bool HandleEvent(const SDL_Event& event) {
             }
             return true;
         }
+#ifdef TLG_RENDERER_V2
+        // steam-deck: L3+R3 juntos marcam o momento (caderno da sessao, TLG_CACA_DIR). O jogo recebe os botoes normal.
+        if (button == SDL_GAMEPAD_BUTTON_LEFT_STICK || button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
+            bool& held = button == SDL_GAMEPAD_BUTTON_LEFT_STICK ? CacaImpl::l3_down : CacaImpl::r3_down;
+            const bool was_both = CacaImpl::l3_down && CacaImpl::r3_down;
+            held = down;
+            if (!was_both && CacaImpl::l3_down && CacaImpl::r3_down && std::getenv("TLG_CACA_DIR"))
+                CacaImpl::mark_request = true;
+        }
+#endif
         // R3+L2 opens the menu: L3+R3 is a game action in God of War III. steam-deck: View only.
         if (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK && !ViewMenu()) {
             r3_down = down;
@@ -3101,6 +3252,9 @@ void SetStartupProgress(int state, u32 done, u32 total) {
 bool StartupActive() {
     return StartupImpl::active;
 }
+void NoteCompile(char kind, u64 hash) {
+    CacaImpl::Compile(kind, hash);
+}
 #endif
 
 void SetLoadingCompile(bool compile) {
@@ -3147,7 +3301,7 @@ bool Visible() {
         steam_file_present = std::filesystem::exists(steam_file, ec);
     }
 #ifdef TLG_RENDERER_V2
-    if (initialized && StartupImpl::active) return true;
+    if (initialized && (StartupImpl::active || CacaImpl::Hunt())) return true;
 #endif
     return initialized && (loading || background_total || menu_open || open_request.load() >= 0 ||
                            steam_file_present || DeckMenuImpl::steam_paused || text_entry_active || choice_active ||
@@ -3294,6 +3448,8 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         static auto window = now;
         static unsigned frames = 0, spikes = 0;
         static float worst = 0.0f;
+        if (!StartupImpl::active)
+            if (const std::string n = CacaImpl::Frame(ms); !n.empty()) Notice(n, 2.5f);
         if (StartupImpl::active) { // a tela de abertura nao conta como jogo nas medicoes
             window = now;
             frames = spikes = 0;
@@ -3394,6 +3550,11 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (NoticeActive() && !menu_open) {
         NoticeBox();
     }
+#ifdef TLG_RENDERER_V2
+    if (!StartupImpl::active && !menu_open) {
+        CacaImpl::DrawCounter();
+    }
+#endif
     if (mouse_pad_on && !menu_open) {
         MousePadBox();
     }
