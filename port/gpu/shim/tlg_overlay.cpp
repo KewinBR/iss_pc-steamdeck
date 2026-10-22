@@ -2184,10 +2184,12 @@ void TextEntryBox() {
 }
 
 // ---- Save dialogs: drawing. The layout is in design pixels of a 1280x720 screen, times k. ----
-constexpr u32 kSaveAccent = 0x5aa9ff, kSaveText = 0xeef2f8, kSaveMuted = 0xaab5c7, kSaveDim = 0x8b97ab,
-              kSavePanel = 0x141923, kSaveLine = 0x263042, kSaveCard = 0x161c28, kSaveCardOn = 0x1f2a3d,
-              kSaveThumb = 0x1d2433, kSaveBorder = 0x2b3445, kSaveKnob = 0x3a4659, kSaveWarn = 0xf0a43a,
-              kSaveOk = 0x4fd1a5;
+// steam-deck: as cores do menu do port (estilo do jogo): amarelo de destaque, branco gelo, cinzas neutros.
+constexpr u32 kSaveAccent = 0xf2b631, kSaveText = 0xe9e7e1, kSaveMuted = 0xd9d6cf, kSaveDim = 0x8b8a86,
+              kSavePanel = 0x0e0f12, kSaveLine = 0x2c2c2a, kSaveCard = 0x15161a, kSaveCardOn = 0x24231f,
+              kSaveThumb = 0x1c1c1e, kSaveBorder = 0x6f6e6a, kSaveKnob = 0x4a4946, kSaveWarn = 0xf08a24,
+              kSaveOk = 0xf2b631;
+constexpr float kSaveRound = 0.0f; // cantos retos, como os paineis do menu
 
 ImU32 SaveColor(u32 rgb, float alpha = 1.0f) {
     return IM_COL32(rgb >> 16, (rgb >> 8) & 255, rgb & 255, int(std::clamp(alpha, 0.0f, 1.0f) * 255.0f));
@@ -2218,18 +2220,19 @@ struct SavePainter {
     void Text(float x, float y, float size, u32 rgb, const std::string& text, bool bold = false,
               float alpha = 1.0f, float wrap = 0.0f) const {
         const ImU32 col = SaveColor(rgb, alpha);
-        dl->AddText(font, size * k, P(x, y), col, text.c_str(), nullptr, wrap * k);
-        if (bold) dl->AddText(font, size * k, P(x + 0.55f, y), col, text.c_str(), nullptr, wrap * k);
+        ImFont* face = bold && DeckMenuImpl::font_bold ? DeckMenuImpl::font_bold : font;
+        dl->AddText(face, size * k * (bold && DeckMenuImpl::font_bold ? 1.12f : 1.0f), P(x, y), col, text.c_str(),
+                    nullptr, wrap * k);
     }
     void TextRight(float right, float y, float size, u32 rgb, const std::string& text, bool bold = false) const {
         Text(right - Width(size, text), y, size, rgb, text, bold);
     }
     void Box(float x0, float y0, float x1, float y1, u32 fill, float rounding, float alpha = 1.0f) const {
-        dl->AddRectFilled(P(x0, y0), P(x1, y1), SaveColor(fill, alpha), rounding * k);
+        dl->AddRectFilled(P(x0, y0), P(x1, y1), SaveColor(fill, alpha), rounding * kSaveRound * k);
     }
     void Frame(float x0, float y0, float x1, float y1, u32 rgb, float rounding, float thickness,
                float alpha = 1.0f) const {
-        dl->AddRect(P(x0, y0), P(x1, y1), SaveColor(rgb, alpha), rounding * k, 0, thickness * k);
+        dl->AddRect(P(x0, y0), P(x1, y1), SaveColor(rgb, alpha), rounding * kSaveRound * k, 0, thickness * k);
     }
     void Line(float x0, float y0, float x1, float y1, u32 rgb, float thickness, float alpha = 1.0f) const {
         dl->AddLine(P(x0, y0), P(x1, y1), SaveColor(rgb, alpha), thickness * k);
@@ -2241,7 +2244,7 @@ struct SavePainter {
         dl->AddCircleFilled(c, 11.0f * k, SaveColor(kSaveThumb));
         dl->AddCircle(c, 11.0f * k, SaveColor(kSaveKnob), 0, 1.0f * k);
         if (const char* letter = PadText(nullptr, which == 0 ? "A" : "B", which == 0 ? "B" : "A")) {
-            const u32 rgb = which == 0 ? kSaveOk : 0xff8a8a;
+            const u32 rgb = which == 0 ? kSaveAccent : kSaveText;
             Text(x - Width(13.0f, letter) / 2, y - 8.0f, 13.0f, rgb, letter, true);
             return;
         }
@@ -2254,7 +2257,7 @@ struct SavePainter {
     }
     // The panel itself: shadow, fill, border; then the discreet credit under its right corner.
     void Panel(float w, float h) const {
-        dl->AddRectFilled(P(0, 18), P(w, h + 18), SaveColor(0x000000, 0.35f), 18.0f * k);
+        dl->AddRectFilled(P(0, 18), P(w, h + 18), SaveColor(0x000000, 0.35f), 18.0f * kSaveRound * k);
         Box(0, 0, w, h, kSavePanel, 18.0f, 0.97f);
         Frame(0, 0, w, h, kSaveBorder, 18.0f, 1.0f);
         const std::string credit = "@hayatog-dev";
@@ -2264,7 +2267,7 @@ struct SavePainter {
     void Picture(float x, float y, float w, float h, ImTextureData* tex, bool is_new) const {
         if (tex) {
             dl->AddImageRounded(tex->GetTexRef(), P(x, y), P(x + w, y + h), ImVec2(0, 0), ImVec2(1, 1),
-                                IM_COL32_WHITE, 10.0f * k);
+                                IM_COL32_WHITE, 10.0f * kSaveRound * k);
             Frame(x, y, x + w, y + h, 0x323d52, 10.0f, 1.0f);
             return;
         }
@@ -2290,7 +2293,8 @@ SavePainter SavePainterFor(float w, float h) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     // 720p design scaled to the display, kept inside the screen on narrow windows.
     const float k = std::min(viewport->WorkSize.y / 720.0f, viewport->WorkSize.x * 0.94f / w);
-    SavePainter p{ImGui::GetForegroundDrawList(), ImGui::GetFont(), k, {}};
+    SavePainter p{ImGui::GetForegroundDrawList(),
+                  DeckMenuImpl::font_regular ? DeckMenuImpl::font_regular : ImGui::GetFont(), k, {}};
     p.at = ImVec2(viewport->WorkPos.x + (viewport->WorkSize.x - w * k) * 0.5f,
                   viewport->WorkPos.y + (viewport->WorkSize.y - h * k) * 0.5f);
     return p;
@@ -2458,8 +2462,6 @@ void SaveListBox() {
     x += 18 + p.Width(13.5f, confirm) + 34;
     p.Button(x, fy + footer_h / 2, 1);
     p.Text(x + 18, fy + footer_h / 2 - 9, 13.5f, 0xb8c2d3, TL("Back", "Voltar"));
-    p.TextRight(w - 28, fy + footer_h / 2 - 8, 12.5f, 0x7f8ba0,
-                TL("Enter / click: choose · Esc / right click: back", "Enter / clique: escolher · Esc / botão direito: voltar"));
 }
 
 // The message's words for a system message type (sceSaveDataDialog), the game's own text or an
