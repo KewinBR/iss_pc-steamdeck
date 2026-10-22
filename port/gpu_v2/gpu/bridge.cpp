@@ -617,7 +617,9 @@ extern "C" int iss_gpu_initialize(const IssGpuCallbacks *callbacks){
                 }
                 if(thread_priority_enabled()&&now-last_priority>std::chrono::seconds(10)){raise_gpu_threads();last_priority=now;}
                 // Off the window thread: a changed driver cache takes ~120 ms to write.
-                if(checkpoints&&renderer&&now-last_checkpoint>std::chrono::seconds(30)){
+                // steam-deck: ISS_PIPELINE_CHECKPOINT_S (padrao 30; 0 = so no carregamento e na saida).
+                static const long checkpoint_s=[]{const char *v=std::getenv("ISS_PIPELINE_CHECKPOINT_S");return v&&*v?std::strtol(v,nullptr,10):30L;}();
+                if(checkpoints&&renderer&&checkpoint_s>0&&now-last_checkpoint>std::chrono::seconds(checkpoint_s)){
                     std::thread([renderer]{renderer->GetPipelineCache().CheckpointDriverCache();}).detach();last_checkpoint=now;}
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }

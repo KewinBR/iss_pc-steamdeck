@@ -28,6 +28,10 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
+#include "common/thread.h"
+#include <atomic>
+#include <thread>
+namespace iss { extern std::atomic<unsigned> g_preload_entries, g_preload_total; extern std::atomic<int> g_preload_phase; }
 
 #include <algorithm>
 #include <array>
@@ -467,13 +471,97 @@ static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     }
 }
 
+// steam-deck: a tela de abertura (TlgOverlay::SetStartup). Uma thread apresenta so a sobreposicao enquanto o
+// rasterizer carrega o cache de shaders (construtor) e ate o primeiro Present do jogo, que a para antes de usar a
+// swapchain. Sem ela o Deck ficava com a tela preta uns 7 s a cada abertura. TLG_STARTUP_SCREEN=0 desliga.
+namespace {
+std::thread startup_pump;
+std::atomic<bool> startup_pump_stop{false};
+
+void StartupPumpLoop(Scheduler& scheduler, Swapchain& swapchain) {
+    Common::SetCurrentThreadName("iss:StartupScreen");
+    while (!startup_pump_stop.load(std::memory_order_acquire)) {
+        const int phase = iss::g_preload_phase.load(std::memory_order_relaxed);
+        const u32 entries = iss::g_preload_entries.load(std::memory_order_relaxed);
+        const u32 total = iss::g_preload_total.load(std::memory_order_relaxed);
+        // 1 lendo o cache; 4, 5 e 6 compilando (primeira abertura); o resto prepara.
+        const int state = phase == 1 ? 1 : (phase == 4 || phase == 5 || phase == 6) ? 2 : 0;
+        TlgOverlay::SetStartupProgress(state, entries, state ? total : 0);
+        if (swapchain.AcquireNextImage()) {
+            const vk::Image image = swapchain.Image();
+            const auto cmdbuf = scheduler.CommandBuffer();
+            const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags src,
+                                     vk::AccessFlags dst) {
+                cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                       vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlagBits::eByRegion,
+                                       {}, {},
+                                       vk::ImageMemoryBarrier{
+                                           .srcAccessMask = src,
+                                           .dstAccessMask = dst,
+                                           .oldLayout = from,
+                                           .newLayout = to,
+                                           .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                           .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                           .image = image,
+                                           .subresourceRange{
+                                               .aspectMask = vk::ImageAspectFlagBits::eColor,
+                                               .baseMipLevel = 0,
+                                               .levelCount = 1,
+                                               .baseArrayLayer = 0,
+                                               .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                                           },
+                                       });
+            };
+            barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal,
+                    vk::AccessFlagBits::eNone, vk::AccessFlagBits::eColorAttachmentWrite);
+            TlgOverlay::Render(cmdbuf, swapchain.ImageView(), swapchain.GetExtent());
+            barrier(vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR,
+                    vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eNone);
+            SubmitInfo info{};
+            info.AddWait(swapchain.GetImageAcquiredSemaphore());
+            info.AddSignal(swapchain.GetPresentReadySemaphore());
+            scheduler.Flush(info);
+            std::scoped_lock submit_lock{Scheduler::submit_mutex};
+            swapchain.Present();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+    scheduler.Finish();
+}
+
+std::unique_ptr<Rasterizer> CreateRasterizerWithStartupScreen(const Instance& instance, Scheduler& draw,
+                                                              Scheduler& present, Swapchain& swapchain,
+                                                              Runtime& runtime,
+                                                              AmdGpu::Liverpool* liverpool) {
+    static const bool enabled = [] {
+        const char* p = std::getenv("TLG_STARTUP_SCREEN");
+        return !(p && p[0] == '0');
+    }();
+    if (enabled) {
+        TlgOverlay::Init(instance, swapchain.GetSurfaceFormat().format, swapchain.GetImageCount());
+        TlgOverlay::SetStartup(true);
+        startup_pump_stop = false;
+        startup_pump = std::thread(StartupPumpLoop, std::ref(present), std::ref(swapchain));
+    }
+    return std::make_unique<Rasterizer>(instance, draw, runtime, liverpool);
+}
+
+void StopStartupScreen() {
+    if (!startup_pump.joinable()) return;
+    startup_pump_stop.store(true, std::memory_order_release);
+    startup_pump.join();
+    TlgOverlay::SetStartup(false);
+}
+} // namespace
+
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
       draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
       swapchain{instance, window}, runtime{instance, draw_scheduler},
-      rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
+      rasterizer{CreateRasterizerWithStartupScreen(instance, draw_scheduler, present_scheduler, swapchain, runtime,
+                                                   liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
@@ -926,6 +1014,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     };
 
+    StopStartupScreen(); // steam-deck: o primeiro present do jogo assume a swapchain
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());

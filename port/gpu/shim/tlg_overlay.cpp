@@ -11,6 +11,7 @@ inline bool Mark(unsigned) { return false; }
 #include "tlg_overlay.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cfloat>
 #include <chrono>
@@ -1618,6 +1619,200 @@ void LoadFonts(ImGuiIO& io) {
 
 } // namespace DeckMenuImpl
 
+#ifdef TLG_RENDERER_V2
+// ---- steam-deck: a tela de abertura do renderer v2 (carregamento de shaders) ----
+// Aprovada pelo Kewin em 2026-10-22 (previa em Drive Steamdeck/infamous/arte-loading). Fundo: TLG_LOADING_ART (arte
+// do Delsin com o Deck) cobrindo a tela, fade in de 0,9 s e zoom lento sem fim. Logo: TLG_LOADING_LOGO (o
+// sce_sys/icon0.png do jogo instalado; o fundo preto e os corvos cinza saem aqui), 40% da largura, pintado como spray
+// (cada linha da esquerda pra direita, borda irregular e respingos na frente) e a tinta do O de SON escorrendo ate
+// atras da palavra SHADERS. Titulo, barra e tempo entram juntos da esquerda depois do logo.
+namespace StartupImpl {
+
+std::atomic<bool> active{false};
+std::atomic<int> state{0};
+std::atomic<u32> done{0}, total{0};
+std::chrono::steady_clock::time_point started{}, state_started{};
+int shown_state = -1;
+bool tried = false;
+ImTextureData* art = nullptr;
+ImTextureData* logo = nullptr;
+std::vector<float> edge;               // borda do spray por faixa (pixels a 800 de altura)
+std::vector<std::array<float, 3>> dots; // respingos: x, y (fracao do logo), raio
+
+ImTextureData* MakeTexture(const TlgPng::Image& image) {
+    ImTextureData* tex = IM_NEW(ImTextureData)();
+    tex->Create(ImTextureFormat_RGBA32, image.width, image.height);
+    std::memcpy(tex->GetPixels(), image.rgba.data(), image.rgba.size());
+    ImGui::RegisterUserTexture(tex);
+    return tex;
+}
+
+// imgui_mutex held, before NewFrame.
+void LoadTextures() {
+    if (tried) return;
+    tried = true;
+    TlgPng::Image image;
+    if (const char* p = std::getenv("TLG_LOADING_ART"); p && *p && TlgPng::LoadRgba(p, image))
+        art = MakeTexture(image);
+    if (const char* p = std::getenv("TLG_LOADING_LOGO"); p && *p && TlgPng::LoadRgba(p, image)) {
+        // Fundo preto e corvos cinza fora: alfa pelo canal mais claro; recorte no que sobrou.
+        int x0 = image.width, y0 = image.height, x1 = -1, y1 = -1;
+        for (int y = 0; y < image.height; ++y)
+            for (int x = 0; x < image.width; ++x) {
+                unsigned char* px = &image.rgba[(size_t(y) * image.width + x) * 4];
+                const int m = std::max({px[0], px[1], px[2]});
+                px[3] = (unsigned char)std::clamp((m - 95) * 3, 0, 255);
+                if (px[3] > 128) {
+                    x0 = std::min(x0, x); x1 = std::max(x1, x);
+                    y0 = std::min(y0, y); y1 = std::max(y1, y);
+                }
+            }
+        if (x1 > x0 && y1 > y0) {
+            TlgPng::Image crop;
+            crop.width = x1 - x0 + 1;
+            crop.height = y1 - y0 + 1;
+            crop.rgba.resize(size_t(crop.width) * crop.height * 4);
+            for (int y = 0; y < crop.height; ++y)
+                std::memcpy(&crop.rgba[size_t(y) * crop.width * 4],
+                            &image.rgba[(size_t(y + y0) * image.width + x0) * 4], size_t(crop.width) * 4);
+            logo = MakeTexture(crop);
+        }
+    }
+    std::printf("Overlay: tela de abertura (arte %s, logo %s)\n", art ? "ok" : "ausente", logo ? "ok" : "ausente");
+    // Ruido fixo: borda do spray suavizada e os respingos.
+    unsigned seed = 7;
+    const auto rnd = [&seed] { seed = seed * 1103515245u + 12345u; return float((seed >> 8) & 0xFFFF) / 65535.0f; };
+    edge.resize(256);
+    for (float& e : edge) e = (rnd() * 2.0f - 1.0f) * 14.0f;
+    for (int pass = 0; pass < 3; ++pass)
+        for (size_t i = 0; i < edge.size(); ++i)
+            edge[i] = (edge[i ? i - 1 : 0] + edge[i] + edge[std::min(i + 1, edge.size() - 1)]) / 3.0f;
+    dots.resize(900);
+    for (auto& d : dots) d = {rnd(), rnd(), 1.2f + rnd() * 2.3f};
+}
+
+// imgui_mutex held: quando a tela some, as texturas sao liberadas (a arte tem uns 4 MB).
+void Retire() {
+    for (ImTextureData** t : {&art, &logo})
+        if (*t) {
+            (*t)->WantDestroyNextFrame = true;
+            choice_retired.push_back(*t);
+            *t = nullptr;
+        }
+    choice_retiring = !choice_retired.empty();
+}
+
+float EaseOut(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+}
+
+u32 Col(int r, int g, int b, float a) {
+    return IM_COL32(r, g, b, int(std::clamp(a, 0.0f, 1.0f) * 255.0f));
+}
+
+void Draw() {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float W = vp->Size.x, H = vp->Size.y, s = H / 800.0f;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const auto now = std::chrono::steady_clock::now();
+    if (started == std::chrono::steady_clock::time_point{}) started = now;
+    const float t = std::chrono::duration<float>(now - started).count();
+
+    dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, 255));
+    // Fundo: cobre a tela pela altura, recorte puxado pra esquerda (o Delsin fica a direita), zoom sem fim bem lento.
+    if (art) {
+        const float aw = float(art->Width), ah = float(art->Height);
+        const float sc = std::max(H / ah, W / aw);
+        const float vw = W / sc / aw, vh = H / sc / ah; // parte visivel, em UV
+        const float u0 = (1.0f - vw) * 0.35f, v0 = (1.0f - vh) * 0.5f;
+        const float zoom = 1.0f + 0.35f * (1.0f - std::exp(-t / 90.0f));
+        const float cu = u0 + vw * 0.5f, cv = v0 + vh * 0.5f, hu = vw * 0.5f / zoom, hv = vh * 0.5f / zoom;
+        dl->AddImage(art->GetTexRef(), ImVec2(0, 0), ImVec2(W, H), ImVec2(cu - hu, cv - hv), ImVec2(cu + hu, cv + hv),
+                     Col(255, 255, 255, EaseOut(t / 0.9f)));
+    }
+    // Sombras da previa: embaixo e a esquerda.
+    dl->AddRectFilledMultiColor(ImVec2(0, H * 0.45f), ImVec2(W, H), Col(5, 6, 8, 0), Col(5, 6, 8, 0),
+                                Col(5, 6, 8, 0.84f), Col(5, 6, 8, 0.84f));
+    dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(W * 0.55f, H), Col(5, 6, 8, 0.35f), Col(5, 6, 8, 0),
+                                Col(5, 6, 8, 0), Col(5, 6, 8, 0.35f));
+
+    const float L = 64.0f * s, base_y = 560.0f * s;
+    if (logo) {
+        const float lw = W * 0.40f, lh = lw * float(logo->Height) / float(logo->Width);
+        const float ly = base_y + 36.0f * s - lh;
+        // Sombra suave atras do logo (circulos sobrepostos: o ImGui nao tem gradiente radial).
+        for (int i = 0; i < 10; ++i)
+            dl->AddCircleFilled(ImVec2(L + lw * 0.45f, ly + lh * 0.38f), lw * (0.85f - i * 0.06f), Col(5, 6, 8, 0.06f), 48);
+        const ImTextureRef tex = logo->GetTexRef();
+        const auto strip = [&](float fy0, float fy1, float fx1) { // faixa do logo, em fracoes
+            fx1 = std::clamp(fx1, 0.0f, 1.0f);
+            if (fx1 <= 0.0f || fy1 <= fy0) return;
+            dl->AddImage(tex, ImVec2(L, ly + fy0 * lh), ImVec2(L + fx1 * lw, ly + fy1 * lh), ImVec2(0, fy0),
+                         ImVec2(fx1, fy1));
+        };
+        const float lines[3][2] = {{0.00f, 0.17f}, {0.17f, 0.50f}, {0.50f, 0.80f}};
+        const float t0 = 0.7f, per = 0.42f;
+        const int strips = 140;
+        for (int i = 0; i < 3; ++i) {
+            const float k = (t - t0 - i * per * 0.8f) / per;
+            if (k <= 0.0f) continue;
+            const float front = EaseOut(k) * (lw + 60.0f * s) - 30.0f * s;
+            for (int j = int(lines[i][0] * strips); j < int(lines[i][1] * strips); ++j)
+                strip(float(j) / strips, float(j + 1) / strips, (front + edge[j % edge.size()] * s) / lw);
+            if (k < 1.0f)
+                for (const auto& d : dots) {
+                    const float dx = d[0] * lw;
+                    if (d[1] < lines[i][0] || d[1] >= lines[i][1] || dx <= front || dx >= front + 70.0f * s) continue;
+                    const float r = d[2] * s, cx = L + dx, cy = ly + d[1] * lh;
+                    dl->AddImage(tex, ImVec2(cx - r, cy - r), ImVec2(cx + r, cy + r),
+                                 ImVec2((dx - r) / lw, d[1] - r / lh), ImVec2((dx + r) / lw, d[1] + r / lh));
+                }
+        }
+        // A tinta escorrendo, de cima pra baixo, depois do SON.
+        const float kd = (t - t0 - 3 * per * 0.8f - per * 0.4f) / 0.7f;
+        if (kd > 0.0f) strip(0.74f, 0.74f + 0.26f * EaseOut(kd), 1.0f);
+    }
+
+    // Titulo, barra e tempo: entram da esquerda depois do logo.
+    const float k = EaseOut((t - (logo ? 2.6f : 0.6f)) / 0.55f);
+    if (k <= 0.0f) return;
+    ImFont* reg = DeckMenuImpl::font_regular ? DeckMenuImpl::font_regular : ImGui::GetFont();
+    ImFont* bold = DeckMenuImpl::font_bold ? DeckMenuImpl::font_bold : reg;
+    const float x = -640.0f * s + (L + 640.0f * s) * k;
+    const int st = state.load();
+    if (st != shown_state) { shown_state = st; state_started = now; }
+    const u32 d = done.load(), n = total.load();
+    const char* title = st == 2 ? "COMPILANDO SHADERS" : st == 1 ? "CARREGANDO SHADERS" : "PREPARANDO O JOGO";
+    DeckMenuImpl::Text(dl, bold, 44.0f * s, ImVec2(x, base_y), DeckMenuImpl::Branco, title);
+    if (n == 0) return;
+    const float bw = 496.0f * s, by = base_y + 70.0f * s, frac = std::clamp(float(d) / float(n), 0.0f, 1.0f);
+    dl->AddRectFilled(ImVec2(x, by), ImVec2(x + bw, by + 10.0f * s), IM_COL32(52, 52, 52, 255));
+    dl->AddRectFilled(ImVec2(x, by), ImVec2(x + bw * frac, by + 10.0f * s), DeckMenuImpl::Amarelo);
+    const auto dotted = [](u32 v) { // 20130 -> 20.130
+        std::string t = std::to_string(v);
+        for (int i = int(t.size()) - 3; i > 0; i -= 3) t.insert(size_t(i), ".");
+        return t;
+    };
+    const std::string count = dotted(d) + " / " + dotted(n);
+    char pct[16];
+    std::snprintf(pct, sizeof(pct), "%u%%", unsigned(frac * 100.0f));
+    DeckMenuImpl::Text(dl, reg, 22.0f * s, ImVec2(x, by + 24.0f * s), DeckMenuImpl::Texto, count.c_str());
+    DeckMenuImpl::Text(dl, reg, 22.0f * s,
+                       ImVec2(x + bw - DeckMenuImpl::Measure(reg, 22.0f * s, pct).x, by + 24.0f * s),
+                       DeckMenuImpl::Amarelo, pct);
+    const float elapsed = std::chrono::duration<float>(now - state_started).count();
+    if (d > 0 && d < n && elapsed > 3.0f) {
+        const unsigned left = unsigned(elapsed * float(n - d) / float(d)) + 1;
+        char text[48];
+        std::snprintf(text, sizeof(text), "Faltam cerca de %u:%02u", left / 60, left % 60);
+        DeckMenuImpl::Text(dl, reg, 22.0f * s, ImVec2(x, by + 58.0f * s), DeckMenuImpl::Texto, text);
+    }
+}
+
+} // namespace StartupImpl
+#endif
+
 void Menu() {
     auto& s = TlgSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -2894,6 +3089,20 @@ void SetBackgroundLoading(u32 done, u32 total) {
     background_total = total;
 }
 
+#ifdef TLG_RENDERER_V2
+void SetStartup(bool on) {
+    StartupImpl::active = on;
+}
+void SetStartupProgress(int state, u32 done, u32 total) {
+    StartupImpl::state = state;
+    StartupImpl::done = done;
+    StartupImpl::total = total;
+}
+bool StartupActive() {
+    return StartupImpl::active;
+}
+#endif
+
 void SetLoadingCompile(bool compile) {
     if (compile && !loading_compile) {
         loading_compile_started = std::chrono::steady_clock::now();
@@ -2937,6 +3146,9 @@ bool Visible() {
         std::error_code ec;
         steam_file_present = std::filesystem::exists(steam_file, ec);
     }
+#ifdef TLG_RENDERER_V2
+    if (initialized && StartupImpl::active) return true;
+#endif
     return initialized && (loading || background_total || menu_open || open_request.load() >= 0 ||
                            steam_file_present || DeckMenuImpl::steam_paused || text_entry_active || choice_active ||
                            message_active || guide_active || progress_on || now < progress_until || now < toast_until ||
@@ -3080,13 +3292,26 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
 #ifdef TLG_RENDERER_V2
     { // steam-deck (medição): mesma linha do renderer deste port, a cada 5 s
         static auto window = now;
-        static unsigned frames = 0;
+        static unsigned frames = 0, spikes = 0;
+        static float worst = 0.0f;
+        if (StartupImpl::active) { // a tela de abertura nao conta como jogo nas medicoes
+            window = now;
+            frames = spikes = 0;
+            worst = 0.0f;
+        }
         ++frames;
+        if (ms < 1000.0f) {
+            worst = std::max(worst, ms);
+            spikes += ms > 50.0f;
+        }
         const float secs = std::chrono::duration<float>(now - window).count();
         if (secs >= 5.0f) {
-            std::printf("Frame stats: %.1f FPS (renderer v2)\n", frames / secs);
+            std::printf("Frame stats: %.1f FPS (renderer v2), pior %.1f ms, acima de 50 ms %u\n", frames / secs,
+                        worst, spikes);
             std::fflush(stdout);
             frames = 0;
+            spikes = 0;
+            worst = 0.0f;
             window = now;
         }
     }
@@ -3113,9 +3338,21 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         base_scale = scale;
     }
 
+#ifdef TLG_RENDERER_V2
+    if (StartupImpl::active) {
+        StartupImpl::LoadTextures();
+    } else if (StartupImpl::art || StartupImpl::logo) {
+        StartupImpl::Retire();
+    }
+#endif
     UpdateChoiceTextures();
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
+#ifdef TLG_RENDERER_V2
+    if (StartupImpl::active) {
+        StartupImpl::Draw();
+    } else
+#endif
     if (loading) {
         LoadingScreen();
     }

@@ -32,6 +32,13 @@ void UpdateTextInput(SDL_Window* window);
 void SetLoading(bool active, u32 done, u32 total);
 /// The loading screen says the shaders are being compiled (first-run compilation), with the time left.
 void SetLoadingCompile(bool compile);
+/// steam-deck (renderer v2): the start-up screen (art, the game's logo, the loading block), shown from the
+/// swapchain's creation until the game's first frame. state: 0 preparing, 1 loading the shader cache, 2 compiling
+/// shaders; `total` 0 hides the bar.
+void SetStartup(bool active);
+void SetStartupProgress(int state, u32 done, u32 total);
+bool StartupActive();
+
 /// Background cache warm-up: a small corner note while the game runs; `total` 0 hides it.
 void SetBackgroundLoading(u32 done, u32 total);
 
