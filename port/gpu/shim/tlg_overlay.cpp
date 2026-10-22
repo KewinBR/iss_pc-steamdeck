@@ -1865,7 +1865,12 @@ std::FILE* File() {
 }
 
 void Shot(const char* why, float t) {
-    VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+    static const bool overlays = [] { // TLG_SHOT_OVERLAY=1: o print leva a sobreposicao do port junto (testes)
+        const char* p = std::getenv("TLG_SHOT_OVERLAY");
+        return p && p[0] == 1;
+    }();
+    VideoCore::RequestScreenshot(overlays ? VideoCore::ScreenshotRequest::WithOverlays
+                                          : VideoCore::ScreenshotRequest::GameOnly);
     last_shot = t;
     if (std::FILE* f = File()) {
         const std::time_t now = std::time(nullptr);
@@ -1906,6 +1911,12 @@ std::string Frame(float ms) {
     const float t = Now();
     frames.emplace_back(t, ms);
     while (!frames.empty() && frames.front().first < t - 10.0f) frames.pop_front();
+    // TLG_SHOT_EVERY_S=N (comparacao de imagem entre builds): um print a cada N s de jogo.
+    static const float every = [] {
+        const char* p = std::getenv("TLG_SHOT_EVERY_S");
+        return p && *p ? float(std::atof(p)) : 0.0f;
+    }();
+    if (every > 0.0f && t - last_shot >= every) Shot("periodico", t);
     if (ms > 250.0f && ms < 5000.0f) {
         if (std::FILE* f = File()) std::fprintf(f, "t=%.1f quadro de %.0f ms\n", t, ms);
         if (t - last_shot > 20.0f) Shot("travada", t);
@@ -1952,6 +1963,47 @@ void DrawCounter() {
 }
 
 } // namespace CacaImpl
+
+// ---- steam-deck: pular video (segurar A) ----
+// No canto de baixo, no estilo do menu do port: "Carregando..." com um arco girando enquanto o jogo carrega por
+// tras do video; depois o botao A com um anel amarelo que enche segurando e "PULAR" na fonte de titulo do jogo.
+namespace SkipImpl {
+std::atomic<int> state{0};
+std::atomic<float> progress{0.0f};
+std::chrono::steady_clock::time_point since{};
+
+void Draw() {
+    const int st = state.load();
+    if (!st) return;
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float s = vp->Size.y / 800.0f;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImFont* reg = DeckMenuImpl::font_regular ? DeckMenuImpl::font_regular : ImGui::GetFont();
+    ImFont* bold = DeckMenuImpl::font_bold ? DeckMenuImpl::font_bold : reg;
+    const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - since).count();
+    const float r = 15.0f * s;
+    const ImVec2 c(vp->Size.x - 150.0f * s, vp->Size.y - 48.0f * s);
+    const char* text = st == 1 ? "CARREGANDO..." : "PULAR";
+    const float size = 26.0f * s;
+    const ImVec2 at(c.x + r + 12.0f * s, c.y - size * 0.55f);
+    dl->AddText(bold, size, ImVec2(at.x + 1.5f * s, at.y + 1.5f * s), IM_COL32(0, 0, 0, 160), text);
+    dl->AddText(bold, size, at, DeckMenuImpl::Branco, text);
+    if (st == 1) {
+        dl->PathArcTo(c, r, t * 6.0f, t * 6.0f + 4.4f, 24);
+        dl->PathStroke(DeckMenuImpl::Amarelo, 0, 2.6f * s);
+        return;
+    }
+    dl->AddCircleFilled(c, r, IM_COL32(14, 15, 18, 200), 32);
+    dl->AddCircle(c, r, IM_COL32(233, 231, 225, 110), 32, 2.0f * s);
+    const float p = std::clamp(progress.load(), 0.0f, 1.0f);
+    if (p > 0.0f) {
+        dl->PathArcTo(c, r, -1.5708f, -1.5708f + p * 6.2832f, 40);
+        dl->PathStroke(DeckMenuImpl::Amarelo, 0, 3.0f * s);
+    }
+    const ImVec2 a = DeckMenuImpl::Measure(bold, 18.0f * s, "A");
+    dl->AddText(bold, 18.0f * s, ImVec2(c.x - a.x * 0.5f, c.y - a.y * 0.5f), DeckMenuImpl::Branco, "A");
+}
+} // namespace SkipImpl
 #endif
 
 void Menu() {
@@ -3255,6 +3307,11 @@ bool StartupActive() {
 void NoteCompile(char kind, u64 hash) {
     CacaImpl::Compile(kind, hash);
 }
+void MovieSkip(int state, float progress) {
+    if (state && !SkipImpl::state.load()) SkipImpl::since = std::chrono::steady_clock::now();
+    SkipImpl::progress = progress;
+    SkipImpl::state = state;
+}
 #endif
 
 void SetLoadingCompile(bool compile) {
@@ -3301,7 +3358,7 @@ bool Visible() {
         steam_file_present = std::filesystem::exists(steam_file, ec);
     }
 #ifdef TLG_RENDERER_V2
-    if (initialized && (StartupImpl::active || CacaImpl::Hunt())) return true;
+    if (initialized && (StartupImpl::active || CacaImpl::Hunt() || SkipImpl::state.load())) return true;
 #endif
     return initialized && (loading || background_total || menu_open || open_request.load() >= 0 ||
                            steam_file_present || DeckMenuImpl::steam_paused || text_entry_active || choice_active ||
@@ -3553,6 +3610,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
 #ifdef TLG_RENDERER_V2
     if (!StartupImpl::active && !menu_open) {
         CacaImpl::DrawCounter();
+        SkipImpl::Draw();
     }
 #endif
     if (mouse_pad_on && !menu_open) {

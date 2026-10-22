@@ -34,6 +34,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
+#include <vk_mem_alloc.h> // MEM_REPORT
 namespace VideoCore {
 
 // steam-deck: ISS_GC_TEXTURE_ONLY=1, o coletor de texturas mede so as texturas (ver SetupGcThresholds/GarbageCollectImages).
@@ -1695,8 +1696,35 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
 }
 
+extern std::atomic<u64> g_arena_resident_bytes, g_arena_allocated_bytes; // buffer_cache.cpp
+// steam-deck: MEM_REPORT (diagnostico do vazamento de memoria, 2026-10-22).
+static void MemReport(const Vulkan::Instance& instance, u64 textures, size_t images) {
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props{.pNext = &budget};
+    instance.GetPhysicalDevice().getMemoryProperties2(&props);
+    VmaTotalStatistics stats{};
+    vmaCalculateStatistics(instance.GetAllocator(), &stats);
+    long rss = 0, pages = 0;
+    if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
+        if (std::fscanf(f, "%ld %ld", &pages, &rss) != 2) rss = 0;
+        std::fclose(f);
+    }
+    std::fprintf(stderr, "MEM_REPORT heaps=");
+    for (u32 h = 0; h < props.memoryProperties.memoryHeapCount; ++h)
+        std::fprintf(stderr, "%s%llu/%lluMB", h ? "," : "", (unsigned long long)(budget.heapUsage[h] >> 20),
+                     (unsigned long long)(budget.heapBudget[h] >> 20));
+    std::fprintf(stderr, " vma_blocks=%lluMB vma_allocs=%u/%lluMB arena_resident=%lluMB arena_alloc=%lluMB "
+                         "textures=%lluMB images=%zu rss=%ldMB\n",
+                 (unsigned long long)(stats.total.statistics.blockBytes >> 20), stats.total.statistics.allocationCount,
+                 (unsigned long long)(stats.total.statistics.allocationBytes >> 20),
+                 (unsigned long long)(g_arena_resident_bytes.load() >> 20),
+                 (unsigned long long)(g_arena_allocated_bytes.load() >> 20), (unsigned long long)(textures >> 20),
+                 images, rss * 4 / 1024);
+}
+
 void TextureCache::GarbageCollectImages() {
     static std::atomic<u64> spared{}, deleted{};
+    if (gc_tick % 600 == 0) MemReport(instance, total_used_memory, slot_images.size());
     if (gc_tick % 600 == 0)
         std::fprintf(stderr, "TEXTURE_GC spared=%llu deleted=%llu streak_images=%llu used=%llu MB trigger=%llu MB\n",
                      (unsigned long long)spared.load(), (unsigned long long)deleted.load(),

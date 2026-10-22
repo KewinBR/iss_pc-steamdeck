@@ -227,6 +227,11 @@ extern "C" void tlggpu_overlay_request_open(int open) { TlgOverlay::RequestOpen(
 extern "C" void tlggpu_set_guest_paused(int paused) {
     DebugState.guest_paused.store(paused != 0, std::memory_order_release);
 }
+// steam-deck: pular video (runtime_movie_poll): 0 nada, 1 "Carregando...", 2 "A Pular" com o anel em progress.
+extern "C" void tlggpu_movie_skip_ui(int state, float progress) {
+    if (g_window) TlgOverlay::MovieSkip(state, progress);
+}
+
 extern "C" void tlggpu_overlay_notice(const char* text, float seconds) {
     TlgOverlay::Notice(text ? text : "", seconds);
 }

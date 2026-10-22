@@ -1075,6 +1075,10 @@ static void sample(PadData *d) {
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
     if (!play_two_finger(d)) play_click(d);
+    { /* steam-deck: pular video segurando o X do PS4 (A no Deck; tambem pelo arquivo de botoes nos testes) */
+        void runtime_movie_poll(int a_held);
+        runtime_movie_poll((d->buttons & BTN_CROSS)!=0);
+    }
     if (hold_after_capture) {
         if (d->buttons) d->buttons=0;
         else hold_after_capture=0;

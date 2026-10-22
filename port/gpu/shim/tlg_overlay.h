@@ -39,6 +39,8 @@ void SetStartup(bool active);
 /// steam-deck (renderer v2): uma compilacao de pipeline durante o jogo (kind 'g' grafico, 'c' compute), qualquer
 /// thread: vai pro caderno da sessao (TLG_CACA_DIR) e pro contador do modo caca.
 void NoteCompile(char kind, u64 hash);
+/// steam-deck (renderer v2): o aviso de pular video. state 0 nada, 1 carregando, 2 "A Pular" (progress 0..1).
+void MovieSkip(int state, float progress);
 void SetStartupProgress(int state, u32 done, u32 total);
 bool StartupActive();
 

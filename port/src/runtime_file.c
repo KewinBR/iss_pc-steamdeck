@@ -59,6 +59,7 @@ typedef struct { int used, host; Listing *dir; size_t position; char path[512];
 typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
+void runtime_movie_opened(int fd); void runtime_movie_closed(int fd);
 static size_t mount_count, opens, reads, writes, missing;
 static size_t bounce_reads, direct_reads; /* TLG_FILE_DIRECT: which path each chunk of a read took */
 static uint64_t bytes_read;
@@ -264,6 +265,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     tlggpu_note_open(guest); /* region trace (TLG_REGION_TRACE=1) */
     runtime_videodec_note_open(guest); /* steam-deck: 16:10 crop of full-screen movies */
+    { const size_t gl=strlen(guest); if (gl>4 && !strcmp(guest+gl-4,".bsf") && strstr(guest,"/movies/cutscene/")) runtime_movie_opened(fd); } /* pular video: so as cenas (os de interface e as TVs nao) */
     ++opens;
     pthread_mutex_unlock(&lock);
     if (runtime_verbose()) {
@@ -286,6 +288,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     return fd;
 }
 static int64_t do_close(int fd) {
+    runtime_movie_closed(fd); /* steam-deck: pular video */
     if (fd>=0 && fd<3) return 0;
     pthread_mutex_lock(&lock);
     File *f=get(fd);
@@ -412,7 +415,11 @@ static ssize_t full_io(int h,void *buffer,uint64_t size,int64_t offset) {
     if (stalls>=64) log_read_problem("io (gave up after 64 retries)",h,size,offset,(ssize_t)done,EFAULT);
     return (ssize_t)done;
 }
+void runtime_movie_opened(int fd); void runtime_movie_closed(int fd); int runtime_movie_eof(int fd);
+void runtime_movie_note_read(int fd,uint64_t size);
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
+    if (runtime_movie_eof(fd)) return 0; /* steam-deck: video pulado */
+    runtime_movie_note_read(fd,size);
     int h=host_fd(fd);
     if (h<0) return -EBADF;
 #ifdef _WIN32
@@ -432,6 +439,8 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     return n;
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
+    if (runtime_movie_eof(fd)) return 0; /* steam-deck: video pulado */
+    runtime_movie_note_read(fd,size);
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     ssize_t n=full_io(h,buffer,size,offset);

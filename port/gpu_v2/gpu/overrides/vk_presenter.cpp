@@ -480,7 +480,7 @@ std::atomic<bool> startup_pump_stop{false};
 // O contexto atual do ImGui e global (GImGui): a sobreposicao troca para o dela durante o Render, e o VideoOut cria as
 // texturas dos quadros em branco (RecreateFrame, ImGui::Vulkan::AddTexture) com o contexto do presenter. Ao mesmo
 // tempo, o AddTexture lia o contexto da sobreposicao e derrubava o jogo (2026-10-22): os dois passam por este lock.
-std::mutex startup_imgui_mutex;
+std::recursive_mutex startup_imgui_mutex;
 
 void StartupPumpLoop(Scheduler& scheduler, Swapchain& swapchain) {
     Common::SetCurrentThreadName("iss:StartupScreen");
@@ -1061,6 +1061,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     ASSERT_MSG(reset_result == vk::Result::eSuccess,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
+    // steam-deck: o contexto atual do ImGui e global; a sobreposicao troca pro dela no Render e o RecreateFrame (thread
+    // do CP, PrepareFrame) cria e apaga texturas com o do presenter. Os dois passam pelo mesmo lock.
+    std::unique_lock imgui_lock{startup_imgui_mutex};
     ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
 
     const vk::Image swapchain_image = swapchain.Image();
@@ -1189,6 +1192,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
         TlgOverlay::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
+        imgui_lock.unlock();
 
         if (capture_with_overlays_count > 0) {
             auto& readback = pending_screenshot.emplace(

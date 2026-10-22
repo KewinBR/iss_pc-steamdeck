@@ -94,10 +94,59 @@ static ABI int32_t videodec_create(const ConfigInfo *config, const ResourceInfo 
  * the game fits it to the screen, so it fills it with no bars and no stretching. Every movie is cropped (power
  * previews and in-game TVs too: the Kewin chose immersion); movie_path is kept for the log. */
 static char movie_path[256];
+/* steam-deck: pular video (segurar A). O .bsf aberto agora, a ultima leitura de outro arquivo (o jogo carregando
+ * por tras), o ultimo quadro decodificado e o pedido de pular, que faz o .bsf ler fim de arquivo. */
+#include <time.h>
+static volatile int movie_fd=-1, movie_skip=0;
+static volatile uint64_t movie_last_other_read, movie_last_decode;
+static uint64_t movie_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+(uint64_t)(t.tv_nsec/1000000); }
+void tlggpu_movie_skip_ui(int state, float progress) __attribute__((weak));
+void runtime_movie_opened(int fd) { movie_fd=fd; movie_skip=0; }
+void runtime_movie_closed(int fd) { if (fd==movie_fd) { movie_fd=-1; movie_skip=0; } }
+int runtime_movie_eof(int fd) { return movie_skip && fd>=0 && fd==movie_fd; }
+/* Leitura pesada de outro arquivo = carregando: mais de 2 MB em 1,5 s (o audio que toca junto le pouco). */
+void runtime_movie_note_read(int fd, uint64_t size) {
+    static uint64_t window_start, bytes;
+    if (fd==movie_fd || movie_fd<0) return;
+    const uint64_t now=movie_now_ms();
+    if (now-window_start>1500) { window_start=now; bytes=0; }
+    bytes+=size;
+    if (bytes>(2u<<20)) movie_last_other_read=now;
+}
+/* Cada leitura do controle. Estado da tela: 0 nada, 1 carregando, 2 "A Pular" (progress = quanto do anel). */
+void runtime_movie_poll(int a_held) {
+    static int engaged=0, shown=-1;
+    static uint64_t hold_since=0;
+    const uint64_t now=movie_now_ms();
+    const int playing=movie_fd>=0 && now-movie_last_decode<1500;
+    int state=0; float progress=0;
+    if (!playing || movie_skip) { engaged=0; hold_since=0; }
+    else {
+        if (a_held && !engaged) engaged=1;
+        if (engaged) {
+            const int loading=now-movie_last_other_read<1500;
+            if (loading) { state=1; hold_since=0; }
+            else {
+                state=2;
+                if (a_held) { if (!hold_since) hold_since=now; progress=(float)(now-hold_since)/1000.0f; }
+                else hold_since=0;
+                if (progress>=1.0f) {
+                    movie_skip=1; state=0; engaged=0;
+                    printf("Videodec: video pulado (%s)\n",movie_path);
+                    fflush(stdout);
+                }
+            }
+        }
+    }
+    if (tlggpu_movie_skip_ui && (state!=shown || state==2)) { tlggpu_movie_skip_ui(state,progress>1.0f ? 1.0f : progress); shown=state; }
+}
 void runtime_videodec_note_open(const char *guest) {
     const size_t n=guest ? strlen(guest) : 0;
     if (n>4 && !strcmp(guest+n-4,".bsf")) {
         snprintf(movie_path,sizeof(movie_path),"%s",guest);
+        /* steam-deck: cada video aberto vai pro log (lista dos videos que o "pular video" vai cobrir). */
+        printf("Videodec: video %s\n",guest);
+        fflush(stdout);
     }
 }
 static int crop_1610(void) {
@@ -174,6 +223,7 @@ static ABI int32_t videodec_decode(Ctrl *ctrl, const InputData *input, FrameBuff
     d->packet->data=input->au_data; d->packet->size=(int)input->au_size;
     d->packet->pts=(int64_t)input->pts_data; d->packet->dts=(int64_t)input->dts_data;
     d->packet->opaque=(void *)(uintptr_t)input->attached_data;
+    movie_last_decode=movie_now_ms(); /* steam-deck: um video esta tocando (pular video) */
     int sent=avcodec_send_packet(d->codec,d->packet);
     if (sent==AVERROR_EOF) { avcodec_flush_buffers(d->codec); sent=avcodec_send_packet(d->codec,d->packet); } /* after a flush */
     d->packet->data=NULL; d->packet->size=0;

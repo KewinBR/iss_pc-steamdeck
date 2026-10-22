@@ -3334,12 +3334,17 @@ struct ResidencyPool {
 };
 ResidencyPool residency_pool;
 
+} // namespace
+// steam-deck (MEM_REPORT): bytes que a arena de buffers tornou residentes e memoria dedicada que ela alocou.
+std::atomic<u64> g_arena_resident_bytes{0}, g_arena_allocated_bytes{0};
+namespace {
 std::pair<vk::DeviceMemory, u64> AllocateResidency(vk::Device device, u32 type_index, u64 size) {
     static const bool enabled = [] {
         const char* p = std::getenv("ISS_RESIDENCY_POOL");
         return !p || p[0] != '0';
     }();
     const auto allocate = [device, type_index](u64 bytes) {
+        g_arena_allocated_bytes.fetch_add(bytes, std::memory_order_relaxed);
         return Vulkan::Check(device.allocateMemory(vk::MemoryAllocateInfo{
             .allocationSize = bytes,
             .memoryTypeIndex = type_index,
@@ -3404,6 +3409,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     const auto [device_memory, memory_base] = AllocateResidency(
         instance.GetDevice(), arena_memory_type_index, resident_blocks << block_shift);
+    g_arena_resident_bytes.fetch_add(u64(resident_blocks) << block_shift, std::memory_order_relaxed);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
@@ -3820,7 +3826,27 @@ bool BufferCache::EnableUnified() {
         return false; // not mapped yet: the next binding tries again
     }
     if (span->size != size) {
-        return fail("the range is not one contiguous mapping");
+        // steam-deck: o heap unificado pode cobrir mais de um mapeamento do jogo (heap B + heap C, ISS_UNIFIED_RANGE
+        // com o span maior): vale se os pedacos seguem contiguos na memoria de apoio (fisica).
+        u64 covered = span->size;
+        while (covered < size) {
+            const auto next = memory->DescribeBacking(base + covered, size - covered);
+            static int told = 0;
+            if (told < 20) {
+                ++told;
+                std::fprintf(stderr, "UNIFIED_SPAN first=%llx/%llx at=%llx next=%llx/%llx\n",
+                             (unsigned long long)span->physical_start, (unsigned long long)span->size,
+                             (unsigned long long)(base + covered),
+                             (unsigned long long)(next ? next->physical_start : 0),
+                             (unsigned long long)(next ? next->size : 0));
+            }
+            if (!next) return false; // o resto ainda nao foi mapeado
+            if (next->physical_start != span->physical_start + covered) {
+                return fail("the range is not one contiguous mapping");
+            }
+            covered += next->size;
+        }
+        std::fprintf(stderr, "UNIFIED_MEMORY range spans several mappings, contiguous backing\n");
     }
     if ((base & (block_size - 1)) != 0 || (size & (block_size - 1)) != 0) {
         return fail("the range is not aligned to sparse blocks");
