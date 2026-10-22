@@ -3351,6 +3351,8 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
 #ifdef TLG_RENDERER_V2
     if (StartupImpl::active) {
         StartupImpl::Draw();
+    } else if (StartupImpl::tried) {
+        // A tela de abertura ja foi mostrada: a antiga nao aparece depois dela.
     } else
 #endif
     if (loading) {

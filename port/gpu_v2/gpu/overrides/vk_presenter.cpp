@@ -1014,7 +1014,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     };
 
-    StopStartupScreen(); // steam-deck: o primeiro present do jogo assume a swapchain
+    // steam-deck: a tela de abertura fica ate o primeiro quadro do jogo; quadro em branco ou repetido antes dele nao
+    // e apresentado (a thread da tela segue com a swapchain).
+    if (startup_pump.joinable()) {
+        if (!is_game_frame || is_reusing_frame) {
+            free_frame();
+            return;
+        }
+        StopStartupScreen();
+    }
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
