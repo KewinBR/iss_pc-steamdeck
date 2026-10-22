@@ -541,7 +541,11 @@ std::unique_ptr<Rasterizer> CreateRasterizerWithStartupScreen(const Instance& in
         TlgOverlay::Init(instance, swapchain.GetSurfaceFormat().format, swapchain.GetImageCount());
         TlgOverlay::SetStartup(true);
         startup_pump_stop = false;
-        startup_pump = std::thread(StartupPumpLoop, std::ref(present), std::ref(swapchain));
+        // Scheduler proprio: o present_scheduler e usado ao mesmo tempo pelo VideoOut (PrepareBlankFrame) antes do
+        // primeiro quadro do jogo, e dividir o command buffer derrubava a GPU (device lost).
+        static Scheduler& pump_scheduler = *new Scheduler{instance}; // nunca destruido (ordem de saida)
+        (void)present;
+        startup_pump = std::thread(StartupPumpLoop, std::ref(pump_scheduler), std::ref(swapchain));
     }
     return std::make_unique<Rasterizer>(instance, draw, runtime, liverpool);
 }
