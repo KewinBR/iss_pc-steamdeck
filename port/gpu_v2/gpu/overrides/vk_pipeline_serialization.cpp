@@ -322,6 +322,37 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         }
     }
 
+    // steam-deck (estudo da compilacao previa): ISS_KEY_CENSUS=arquivo, uma linha por pipeline grafico carregado:
+    // programa (pgm_hash) e modulo de cada estagio, e o estado fixo da chave (alvos, mistura, profundidade, vertices).
+    static std::FILE* const census = [] {
+        const char* p = std::getenv("ISS_KEY_CENSUS");
+        return p && *p ? std::fopen(p, "w") : nullptr;
+    }();
+    if (census) {
+        static std::mutex census_mutex;
+        std::scoped_lock census_lock{census_mutex};
+        const auto& k = graphics_key;
+        std::fprintf(census, "G");
+        for (int s = 0; s < MaxShaderStages; ++s)
+            if (k.stage_hashes[s])
+                std::fprintf(census, " st%d=%llx:%llx", s,
+                             (unsigned long long)(infos[s] ? infos[s]->pgm_hash : 0),
+                             (unsigned long long)k.stage_hashes[s]);
+        std::fprintf(census, " ncol=%u mrt=%x cbmask=%x samples=%u z=%u st=%u prim=%u poly=%u", k.num_color_attachments,
+                     k.mrt_mask, [&] { u32 m{}; std::memcpy(&m, &k.cb_shader_mask, std::min(sizeof(m), sizeof(k.cb_shader_mask))); return m; }(), k.num_samples, u32(k.z_format), u32(k.stencil_format),
+                     u32(k.prim_type), u32(k.polygon_mode));
+        for (u32 c = 0; c < AmdGpu::NUM_COLOR_BUFFERS; ++c) {
+            u32 cb{}, bl{};
+            std::memcpy(&cb, &k.color_buffers[c], std::min(sizeof(cb), sizeof(k.color_buffers[c])));
+            std::memcpy(&bl, &k.blend_controls[c], std::min(sizeof(bl), sizeof(k.blend_controls[c])));
+            if (cb || bl) std::fprintf(census, " cb%u=%x/%x/%x", c, cb, bl, u32(k.write_masks[c]));
+        }
+        std::fprintf(census, " vtx=");
+        for (u32 v = 0; v < MaxVertexBufferCount && k.vertex_buffer_formats[v] != vk::Format::eUndefined; ++v)
+            std::fprintf(census, "%u,", u32(k.vertex_buffer_formats[v]));
+        std::fputc(10, census);
+        std::fflush(census);
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (!is_new) {
         return false; // the same pipeline from another lineage of a merged library
