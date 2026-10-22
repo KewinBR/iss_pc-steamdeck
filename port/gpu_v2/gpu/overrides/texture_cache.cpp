@@ -36,6 +36,15 @@
 
 namespace VideoCore {
 
+// steam-deck: ISS_GC_TEXTURE_ONLY=1, o coletor de texturas mede so as texturas (ver SetupGcThresholds/GarbageCollectImages).
+static bool GcTextureOnly() {
+    static const bool on = [] {
+        const char* p = std::getenv("ISS_GC_TEXTURE_ONLY");
+        return p && p[0] == '1';
+    }();
+    return on;
+}
+
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
@@ -188,6 +197,16 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     trigger_gc_memory = std::max<u64>(trigger_gc_memory, u64(std::max<s64>(relaxed, 0)));
     if (const char* p = std::getenv("ISS_GC_TRIGGER_MB"))
         trigger_gc_memory = u64(std::strtoull(p, nullptr, 10)) << 20;
+    if (GcTextureOnly()) {
+        const auto mb = [](const char* name, u64 fallback) {
+            const char* p = std::getenv(name);
+            return (p && *p ? u64(std::strtoull(p, nullptr, 10)) : fallback) << 20;
+        };
+        trigger_gc_memory = mb("ISS_GC_TRIGGER_MB", 1536);
+        pressure_gc_memory = mb("ISS_GC_PRESSURE_MB", 2048);
+        critical_gc_memory = mb("ISS_GC_CRITICAL_MB", 2560);
+        std::fprintf(stderr, "TEXTURE_GC texture_only=1 (mede so as texturas)\n");
+    }
     std::fprintf(stderr, "TEXTURE_GC budget=%lld MB trigger=%llu MB pressure=%llu MB critical=%llu MB\n",
                  (long long)(device_local_memory >> 20), (unsigned long long)(trigger_gc_memory >> 20),
                  (unsigned long long)(pressure_gc_memory >> 20),
@@ -1684,7 +1703,7 @@ void TextureCache::GarbageCollectImages() {
                      (unsigned long long)tex_streak_images.load(),
                      (unsigned long long)(total_used_memory >> 20),
                      (unsigned long long)(trigger_gc_memory >> 20));
-    if (instance.CanReportMemoryUsage()) {
+    if (instance.CanReportMemoryUsage() && !GcTextureOnly()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
     if (total_used_memory < trigger_gc_memory) {
