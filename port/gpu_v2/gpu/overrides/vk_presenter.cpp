@@ -477,6 +477,10 @@ static void SavePendingScreenshot(const ScreenshotReadback& readback) {
 namespace {
 std::thread startup_pump;
 std::atomic<bool> startup_pump_stop{false};
+// O contexto atual do ImGui e global (GImGui): a sobreposicao troca para o dela durante o Render, e o VideoOut cria as
+// texturas dos quadros em branco (RecreateFrame, ImGui::Vulkan::AddTexture) com o contexto do presenter. Ao mesmo
+// tempo, o AddTexture lia o contexto da sobreposicao e derrubava o jogo (2026-10-22): os dois passam por este lock.
+std::mutex startup_imgui_mutex;
 
 void StartupPumpLoop(Scheduler& scheduler, Swapchain& swapchain) {
     Common::SetCurrentThreadName("iss:StartupScreen");
@@ -514,7 +518,10 @@ void StartupPumpLoop(Scheduler& scheduler, Swapchain& swapchain) {
             };
             barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal,
                     vk::AccessFlagBits::eNone, vk::AccessFlagBits::eColorAttachmentWrite);
-            TlgOverlay::Render(cmdbuf, swapchain.ImageView(), swapchain.GetExtent());
+            {
+                std::scoped_lock imgui_lock{startup_imgui_mutex};
+                TlgOverlay::Render(cmdbuf, swapchain.ImageView(), swapchain.GetExtent());
+            }
             barrier(vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR,
                     vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eNone);
             SubmitInfo info{};
@@ -625,6 +632,7 @@ bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const
 }
 
 void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
+    std::scoped_lock imgui_lock{startup_imgui_mutex}; // steam-deck: ver startup_imgui_mutex
     const vk::Device device = instance.GetDevice();
     if (frame->imgui_texture) {
         ImGui::Vulkan::RemoveTexture(frame->imgui_texture);
