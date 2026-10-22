@@ -853,7 +853,12 @@ public:
     }
 
     void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
-        if (scheduler && scheduler->GetDynamicState().binds.SkipPipeline(bind_point, pipeline)) {
+        // steam-deck (diagnostico): TLG_CP_NO_BIND_SKIP=1 liga sempre (sem o atalho do BindCache).
+        static const bool no_skip = [] {
+            const char* p = std::getenv("TLG_CP_NO_BIND_SKIP");
+            return p && p[0] == '1';
+        }();
+        if (!no_skip && scheduler && scheduler->GetDynamicState().binds.SkipPipeline(bind_point, pipeline)) {
             return;
         }
         NoteBind();

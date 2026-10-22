@@ -22,6 +22,7 @@ struct Globals {
     const Instance* instance{};
     Scheduler* scheduler{};
     VideoCore::BufferCache* buffer_cache{};
+    VideoCore::TextureCache* texture_cache{}; ///< steam-deck: TLG_PASSES_GEN_GUARD (Generation, lock free)
     PipelineCache* pipeline_cache{}; ///< speculative compute translations (ISS_SPEC_COMPUTE)
     std::atomic<const VideoCore::Buffer*> unified{};
     std::atomic<VAddr> unified_base{};
@@ -225,6 +226,8 @@ static std::vector<u32> InheritedWords(const AmdGpu::Regs& regs, const u32* mask
 // (native_passes.cpp), on whichever thread holds it.
 struct LanePool {
     vk::CommandPool pool{};
+    /// steam-deck: TLG_PASSES_QUARANTINE_MS, secundarios esperando o prazo (quando comecaram a ser gravados).
+    std::deque<std::pair<vk::CommandBuffer, u64>> quarantine;
 };
 
 struct Rec {
@@ -232,6 +235,8 @@ struct Rec {
     u32 generation{}; ///< of the segment it records for
     bool begun{};
     bool needs_reset{};
+    u64 begun_ns{}; ///< steam-deck: quando o secundario comecou a ser gravado (TLG_PASSES_QUARANTINE_MS)
+    u64 exec_tick{}; ///< steam-deck: tick da ultima execucao do secundario (TLG_PASSES_RESET_CHECK)
     const Template* current{};
     vk::Pipeline bound_pipeline{};
     std::vector<std::shared_ptr<const Template>> templates; ///< unique, the first sets formats
@@ -450,6 +455,15 @@ static u32 DynGroupOf(u32 reg) {
     return DynAlways;
 }
 
+// steam-deck (diagnostico): TLG_RING_GRACE=<ticks>, folga antes de aposentar um segmento executado.
+static u64 RingGrace() {
+    static const u64 grace = [] {
+        const char* p = std::getenv("TLG_RING_GRACE");
+        return p ? u64(std::strtoull(p, nullptr, 0)) : 0ull;
+    }();
+    return grace;
+}
+
 // An engine thread's upload ring and descriptor pools. What a segment took is released once the
 // segment is retired, in the order the thread took it.
 constexpr u32 PoolSets = 256;
@@ -481,7 +495,7 @@ struct Worker {
         const u32 state = u.segment->state.load(std::memory_order_acquire);
         if (state == np::Abandoned || state == np::Free) return true;
         if (state != np::Done) return false;
-        return u.segment->executed_tick.load(std::memory_order_relaxed) <=
+        return u.segment->executed_tick.load(std::memory_order_relaxed) + RingGrace() <=
                g.scheduler->GetWorkSemaphore()->KnownGpuTick();
     }
 
@@ -859,6 +873,31 @@ static bool Begin(np::Segment& s, Rec& r, const Template& t) {
         }));
         *s.lane_user = lane;
     }
+    static const bool no_reuse = [] {
+        const char* p = std::getenv("TLG_PASSES_NO_REUSE");
+        return p && p[0] == '1';
+    }();
+    if (no_reuse && r.cmd && r.needs_reset) {
+        r.cmd = vk::CommandBuffer{}; // o antigo fica alocado no pool, nunca resetado
+        r.needs_reset = false;
+    }
+    static const u64 quarantine_ns = [] {
+        const char* p = std::getenv("TLG_PASSES_QUARANTINE_MS");
+        return p ? u64(std::strtoull(p, nullptr, 0)) * 1000000ull : 0ull;
+    }();
+    if (quarantine_ns) {
+        const u64 now = Common::Perf::NowNs();
+        if (r.cmd && r.needs_reset) {
+            lane->quarantine.emplace_back(r.cmd, r.begun_ns);
+            r.cmd = vk::CommandBuffer{};
+            r.needs_reset = false;
+        }
+        while (!lane->quarantine.empty() && now - lane->quarantine.front().second > quarantine_ns) {
+            const vk::CommandBuffer old = lane->quarantine.front().first;
+            g.instance->GetDevice().freeCommandBuffers(lane->pool, 1, &old);
+            lane->quarantine.pop_front();
+        }
+    }
     if (!r.cmd) {
         const vk::CommandBufferAllocateInfo info{
             .commandPool = lane->pool,
@@ -868,6 +907,23 @@ static bool Begin(np::Segment& s, Rec& r, const Template& t) {
         if (g.instance->GetDevice().allocateCommandBuffers(&info, &r.cmd) != vk::Result::eSuccess)
             return false;
     } else if (r.needs_reset) {
+        static const bool reset_check = [] {
+            const char* p = std::getenv("TLG_PASSES_RESET_CHECK");
+            return !(p && p[0] == '0');
+        }();
+        if (reset_check && r.exec_tick) {
+            auto* sem = g.scheduler->GetWorkSemaphore();
+            if (r.exec_tick > sem->KnownGpuTick()) {
+                static std::atomic<u64> early{0};
+                const u64 n = early.fetch_add(1, std::memory_order_relaxed);
+                if (n < 40 || (n & 1023) == 0)
+                    std::fprintf(stderr, "RESET_ANTECIPADO n=%llu tick %llu gpu %llu\n",
+                                 (unsigned long long)n + 1, (unsigned long long)r.exec_tick,
+                                 (unsigned long long)sem->KnownGpuTick());
+                sem->Wait(r.exec_tick);
+            }
+        }
+        r.exec_tick = 0;
         r.cmd.reset();
     }
     const vk::CommandBufferInheritanceRenderingInfo rendering{
@@ -878,13 +934,21 @@ static bool Begin(np::Segment& s, Rec& r, const Template& t) {
         .rasterizationSamples = t.samples,
     };
     const vk::CommandBufferInheritanceInfo inheritance{.pNext = &rendering};
+    // steam-deck (diagnostico): TLG_PASSES_SIMULTANEOUS=1 grava os secundarios com SIMULTANEOUS_USE (o RADV pode
+    // copiar o secundario pro primario em vez de saltar, e o laudo do RADV_DEBUG=hang mostra os comandos dele).
+    static const bool simultaneous = [] {
+        const char* p = std::getenv("TLG_PASSES_SIMULTANEOUS");
+        return p && p[0] == 1;
+    }();
     r.cmd.begin(vk::CommandBufferBeginInfo{
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit |
+        .flags = (simultaneous ? vk::CommandBufferUsageFlagBits::eSimultaneousUse
+                               : vk::CommandBufferUsageFlagBits::eOneTimeSubmit) |
                  vk::CommandBufferUsageFlagBits::eRenderPassContinue,
         .pInheritanceInfo = &inheritance,
     });
     r.begun = true;
     r.needs_reset = true;
+    r.begun_ns = Common::Perf::NowNs();
     r.bb_segment = GpuCrashDiag::Blackbox() ? GpuCrashDiag::NewNativeSegment() : 0;
     r.bb_draws = 0;
     return true;
@@ -979,6 +1043,79 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
     const auto* pipeline = t->pipeline;
     if (!pipeline->IsReady() || (!pipeline->UsesPushDescriptors() && !NativeMaterial::SetsAt('0')))
         return miss(MissPipeline);
+    {
+        static const bool gen_guard = [] {
+            const char* p = std::getenv("TLG_PASSES_GEN_GUARD");
+            return p && p[0] == '1';
+        }();
+        if (gen_guard && g.texture_cache &&
+            t->cache_generation.load(std::memory_order_relaxed) != g.texture_cache->Generation()) {
+            static std::atomic<u64> refused{0};
+            const u64 n = refused.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & 0xFFFF) == 1) std::fprintf(stderr, "PASSES_GEN_GUARD recusados=%llu\n", (unsigned long long)n);
+            return miss(MissTemplate);
+        }
+    }
+    {
+        // steam-deck: TLG_PASSES_DENY, pipelines (vs:ps) que ficam fora dos passes nativos.
+        static const std::vector<std::pair<u64, u64>> deny = [] {
+            std::vector<std::pair<u64, u64>> out;
+            const char* p = std::getenv("TLG_PASSES_DENY");
+            while (p && *p) {
+                char* end = nullptr;
+                const u64 vs = std::strtoull(p, &end, 16);
+                if (!end || *end != ':') break;
+                const u64 ps = std::strtoull(end + 1, &end, 16);
+                out.emplace_back(vs, ps);
+                if (!end || *end != ',') break;
+                p = end + 1;
+            }
+            if (!out.empty()) std::fprintf(stderr, "PASSES_DENY: %zu pipelines\n", out.size());
+            return out;
+        }();
+        if (!deny.empty()) {
+            const u64 vs = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
+            const u64 ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)]
+                               ? pipeline->GetStage(Shader::SwStage::Fragment).pgm_hash
+                               : 0;
+            for (const auto& [dv, dp] : deny)
+                if (dv == vs && dp == ps) return miss(MissPipeline);
+        }
+    }
+    {
+        static const u64 hash_mask = [] {
+            const char* p = std::getenv("TLG_PASSES_HASH_MASK");
+            return p ? u64(std::strtoull(p, nullptr, 0)) : 0ull;
+        }();
+        static const u64 hash_value = [] {
+            const char* p = std::getenv("TLG_PASSES_HASH_VALUE");
+            return p ? u64(std::strtoull(p, nullptr, 0)) : 0ull;
+        }();
+        static const bool hash_log = [] {
+            const char* p = std::getenv("TLG_PASSES_HASH_LOG");
+            return p && p[0] == '1';
+        }();
+        if (hash_mask || hash_log) {
+            const u64 vs = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
+            const u64 ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)]
+                               ? pipeline->GetStage(Shader::SwStage::Fragment).pgm_hash
+                               : 0;
+            u64 mix = (vs * 0x9E3779B97F4A7C15ull) ^ (ps + 0x632BE59BD9B4E019ull);
+            mix ^= mix >> 31;
+            mix *= 0xBF58476D1CE4E5B9ull;
+            mix ^= mix >> 29;
+            if ((mix & hash_mask) != hash_value) return miss(MissPipeline);
+            if (hash_log) {
+                static std::mutex log_mutex;
+                static std::unordered_set<u64> seen;
+                std::scoped_lock lock{log_mutex};
+                if (seen.insert(mix).second)
+                    std::fprintf(stderr, "PASSES_PIPELINE vs %08llx ps %08llx mix %016llx push %d\n",
+                                 (unsigned long long)vs, (unsigned long long)ps,
+                                 (unsigned long long)mix, int(pipeline->UsesPushDescriptors()));
+            }
+        }
+    }
     if (!pipeline->UsesPushDescriptors()) {
         static const u32 sets_filter = [] {
             const char* p = std::getenv("TLG_PASSES_SETS_FILTER");
@@ -1108,7 +1245,11 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         scratch->Commit(*g.instance, CommandRecorder{cmd});
         r.current = t.get();
     }
-    if (pipeline->Handle() != r.bound_pipeline) {
+    static const bool always_bind = [] {
+        const char* p = std::getenv("TLG_PASSES_ALWAYS_BIND");
+        return p && p[0] == '1';
+    }();
+    if (always_bind || pipeline->Handle() != r.bound_pipeline) {
         r.bound_pipeline = pipeline->Handle();
         cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, r.bound_pipeline);
     }
@@ -1182,7 +1323,67 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         info = vk::DescriptorBufferInfo{handle, aligned, sharp.GetSize() + (offset - aligned)};
     }
     NativeMaterial::BuildWrites(*t, infos.data(), writes);
+    {
+        static const bool desc_log = [] {
+            const char* m = std::getenv("TLG_PASSES_HASH_MASK");
+            const char* l = std::getenv("TLG_PASSES_HASH_LOG");
+            return m && l && l[0] == '1';
+        }();
+        static std::atomic<u32> desc_logged{0};
+        if (desc_log && desc_logged.fetch_add(1, std::memory_order_relaxed) < 60) {
+            const auto stages_dbg = pipeline->GetStages();
+            for (u32 k = 0; k < t->buffers.size(); ++k) {
+                const auto& slot = t->buffers[k];
+                const auto& stage = *stages_dbg[slot.stage];
+                u64 base = 0, size = 0;
+                if (slot.special == NativeMaterial::Guest) {
+                    const auto sharp = stage.buffers[slot.desc].GetSharp(stage);
+                    base = sharp.base_address;
+                    size = sharp.GetSize();
+                }
+                std::fprintf(stderr,
+                             "PASSES_DESC draw %u slot %u stage %u special %u buf %llx off %llx range %llx"
+                             " sharp %llx+%llx push_off %u ring %d unified %llx\n",
+                             desc_logged.load(std::memory_order_relaxed), k, u32(slot.stage), u32(slot.special),
+                             (unsigned long long)(VkBuffer)infos[k].buffer, (unsigned long long)infos[k].offset,
+                             (unsigned long long)infos[k].range, (unsigned long long)base,
+                             (unsigned long long)size, u32(push.buf_offsets[slot.binding]),
+                             int(infos[k].buffer == w->ring),
+                             (unsigned long long)(unified ? (VkBuffer)unified->Handle() : VK_NULL_HANDLE));
+                if (infos[k].buffer) {
+                    const u64 va = g.instance->GetDevice().getBufferAddress(
+                        vk::BufferDeviceAddressInfo{.buffer = infos[k].buffer});
+                    std::fprintf(stderr, "PASSES_DESC_VA slot %u va %llx..%llx\n", k,
+                                 (unsigned long long)(va + infos[k].offset),
+                                 (unsigned long long)(va + infos[k].offset + infos[k].range));
+                }
+            }
+        }
+    }
+    {
+        static const bool log_views = [] {
+            const char* p = std::getenv("TLG_LOG_PUSH_VIEWS");
+            return p && p[0] == '1';
+        }();
+        if (log_views) {
+            static std::mutex views_mutex;
+            static std::unordered_set<u64> seen_views;
+            for (const auto& w : writes) {
+                if (!w.pImageInfo) continue;
+                for (u32 e = 0; e < w.descriptorCount; ++e) {
+                    const u64 v = (u64)(VkImageView)w.pImageInfo[e].imageView;
+                    if (!v) continue;
+                    std::scoped_lock lock{views_mutex};
+                    if (seen_views.insert(v).second)
+                        std::fprintf(stderr, "PASSES_VIEW %llx\n", (unsigned long long)v);
+                }
+            }
+        }
+    }
     if (pipeline->UsesPushDescriptors()) {
+        if (NativeMaterial::LayoutCheckEnabled() &&
+            !NativeMaterial::WritesMatchLayout(*pipeline, writes.data(), u32(writes.size()), "passes-push"))
+            return fail(MissPool);
         cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, pipeline->GetLayout(), 0, writes);
     } else if (!writes.empty()) {
         if (NativeMaterial::LayoutCheckEnabled() &&
@@ -1321,7 +1522,7 @@ static void Abandon(np::Segment&) {
 static bool Retired(const np::Segment& s) {
     const u32 state = s.state.load(std::memory_order_acquire);
     if (state == np::Abandoned || state == np::Free) return true;
-    return state == np::Done && s.executed_tick.load(std::memory_order_relaxed) <=
+    return state == np::Done && s.executed_tick.load(std::memory_order_relaxed) + RingGrace() <=
                                     g.scheduler->GetWorkSemaphore()->KnownGpuTick();
 }
 
@@ -1490,6 +1691,7 @@ void Rasterizer::NativePassesSetup() {
     g.instance = &instance;
     g.scheduler = &scheduler;
     g.buffer_cache = &buffer_cache;
+    g.texture_cache = &texture_cache;
     g.pipeline_cache = &pipeline_cache;
     Shader::Info::ud_snapshots_used.store(true, std::memory_order_relaxed);
     g.ready.store(true, std::memory_order_release);
@@ -1892,6 +2094,23 @@ bool Rasterizer::NativePassExecute(iss::native_passes::Segment& s,
         primary.executeCommands(cmd);
     });
     scheduler.EndRendering();
+    {
+        static const bool full_barrier = [] {
+            const char* p = std::getenv("TLG_PASSES_FULL_BARRIER");
+            return p && p[0] == '1';
+        }();
+        if (full_barrier) {
+            scheduler.Recorder().Record([](vk::CommandBuffer primary) {
+                const vk::MemoryBarrier2 barrier{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                };
+                primary.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+            });
+        }
+    }
     scheduler.GetDynamicState().Invalidate();
     fast_draw.valid = false;
     for (const u32* packet : s.draw_packets) {
@@ -1905,6 +2124,15 @@ bool Rasterizer::NativePassExecute(iss::native_passes::Segment& s,
         Rt().AccessBuffer(rd.buffer, rd.offset, rd.size, vk::PipelineStageFlagBits2::eAllGraphics,
                           vk::AccessFlagBits2::eShaderRead);
     tick = scheduler.CurrentTick();
+    r->exec_tick = tick;
+    {
+        static const bool submit_after = [] {
+            const char* p = std::getenv("TLG_SUBMIT_AFTER_SEGMENT"); // diagnostico antigo, sem efeito
+            return p && p[0] == '1';
+        }();
+        (void)submit_after;
+        g_segment_poisoned = true; // steam-deck: o proximo desenho/dispatch do CP submete antes (SubmitAfterSegments)
+    }
     ++c.executed;
     c.draws += s.draw_packets.size();
     if (indirect_first) {

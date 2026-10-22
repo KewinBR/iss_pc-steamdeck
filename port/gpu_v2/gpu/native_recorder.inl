@@ -1026,6 +1026,7 @@ u32 Rasterizer::NativeRecorderExecute(const iss::native_gbuffer::Batch& b, u64 c
         cmd.executeCommands(secondaries);
     });
     scheduler.EndRendering();
+    g_segment_poisoned = true; // steam-deck: estado do primario indefinido depois do secundario (SubmitAfterSegments)
     // Nothing bound by the secondary survives it in the primary.
     scheduler.GetDynamicState().Invalidate();
     fast_draw.valid = false;

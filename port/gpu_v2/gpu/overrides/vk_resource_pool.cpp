@@ -1,3 +1,6 @@
+#include <vector>
+#include <thread>
+#include <atomic>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -132,6 +135,35 @@ DescriptorHeap::~DescriptorHeap() {
 }
 
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
+    static const bool no_recycle = [] { const char* p = std::getenv("TLG_HEAP_NO_RECYCLE"); return p && p[0] == '1'; }();
+    static const bool single = [] { const char* p = std::getenv("TLG_HEAP_SINGLE"); return p && p[0] == '1'; }();
+    static const bool thread_check = [] { const char* p = std::getenv("TLG_HEAP_THREAD_CHECK"); return p && p[0] == '1'; }();
+    if (thread_check) {
+        static std::atomic<std::thread::id> owner{};
+        std::thread::id expected{};
+        const auto me = std::this_thread::get_id();
+        if (!owner.compare_exchange_strong(expected, me) && expected != me) {
+            static std::atomic<u32> reports{0};
+            if (reports.fetch_add(1) < 20) std::fprintf(stderr, "HEAP_THREAD: Commit em outra thread (heap %p)\n", (void*)this);
+        }
+    }
+    if (single) {
+        vk::DescriptorSetAllocateInfo one{.descriptorPool = curr_pool, .descriptorSetCount = 1, .pSetLayouts = &set_layout};
+        vk::DescriptorSet set{};
+        if (device.allocateDescriptorSets(&one, &set) == vk::Result::eSuccess) return set;
+        pending_pools.emplace_back(curr_pool, work_semaphore->CurrentTick());
+        if (!no_recycle && work_semaphore->IsFree(pending_pools.front().second)) {
+            curr_pool = pending_pools.front().first;
+            pending_pools.pop_front();
+            (void)device.resetDescriptorPool(curr_pool);
+        } else {
+            CreateDescriptorPool();
+        }
+        one.descriptorPool = curr_pool;
+        const auto r = device.allocateDescriptorSets(&one, &set);
+        ASSERT_MSG(r == vk::Result::eSuccess, "single set allocation {}", vk::to_string(r));
+        return set;
+    }
     const u64 set_key = std::bit_cast<u64>(set_layout);
     const auto [it, _] = descriptor_sets.try_emplace(set_key);
 
@@ -166,7 +198,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
                    result == vk::Result::eErrorFragmentedPool,
                "Unexpected error during descriptor set allocation: {}", vk::to_string(result));
     pending_pools.emplace_back(curr_pool, work_semaphore->CurrentTick());
-    if (const auto [pool, tick] = pending_pools.front(); work_semaphore->IsFree(tick)) {
+    if (const auto [pool, tick] = pending_pools.front(); !no_recycle && work_semaphore->IsFree(tick)) {
         curr_pool = pool;
         pending_pools.pop_front();
 
@@ -192,11 +224,16 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
 }
 
 void DescriptorHeap::CreateDescriptorPool() {
+    // steam-deck (diagnostico): TLG_HEAP_SLACK=1, +64 de cada tipo de descritor em cada pool.
+    static const bool slack = [] { const char* p = std::getenv("TLG_HEAP_SLACK"); return p && p[0] == '1'; }();
+    std::vector<vk::DescriptorPoolSize> sizes(pool_sizes.begin(), pool_sizes.end());
+    if (slack)
+        for (auto& sz : sizes) sz.descriptorCount += 64;
     const vk::DescriptorPoolCreateInfo pool_info = {
         .flags = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
         .maxSets = descriptor_heap_count,
-        .poolSizeCount = static_cast<u32>(pool_sizes.size()),
-        .pPoolSizes = pool_sizes.data(),
+        .poolSizeCount = static_cast<u32>(sizes.size()),
+        .pPoolSizes = sizes.data(),
     };
     auto [pool_result, pool] = device.createDescriptorPool(pool_info);
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create descriptor pool: {}",

@@ -127,6 +127,8 @@ namespace iss::asc_family {extern u32 family;extern thread_local u32 pool_family
 uint64_t IssImageBase(); // bridge.cpp
 
 namespace Vulkan {
+class GraphicsPipeline;
+bool IssCpLayoutCheck(const GraphicsPipeline& pipeline, const vk::WriteDescriptorSet* writes, u32 count);
 
 thread_local Rasterizer::SplitThreadState Rasterizer::split_thread_state{};
 #include "draw_pipe_rasterizer.inl"
@@ -156,6 +158,19 @@ void SubmitFeedbackBatch(Scheduler& scheduler) {
 // ISS_SUBMIT_INTERVAL_US=N: also once the batch has been recorded for N us. A native segment counts
 // as one draw, so with ~150 segments a frame the batches went out ~13 times a frame, up to 2.4 ms
 // apart: the GPU waited for the next one, then fell behind on a heavy one (a1-jobwait 2026-10-18).
+// steam-deck: o command buffer recebeu um vkCmdExecuteCommands (segmento nativo) desde a ultima submissao. O estado
+// ligado dele fica indefinido e o RADV nao o preserva: o proximo desenho/dispatch do CP vai pra um command buffer novo
+// (SubmitAfterSegments, no inicio dele). TLG_SEGMENT_SUBMIT=0 desliga.
+thread_local bool g_segment_poisoned{};
+void SubmitAfterSegments(Scheduler& scheduler) {
+    static const bool on = [] {
+        const char* p = std::getenv("TLG_SEGMENT_SUBMIT");
+        return !(p && p[0] == '0');
+    }();
+    if (!on || !g_segment_poisoned) return;
+    g_segment_poisoned = false;
+    scheduler.Flush();
+}
 thread_local u64 periodic_tick{};
 thread_local u32 periodic_draws{};
 thread_local u64 periodic_start_ns{};
@@ -1364,7 +1379,7 @@ std::size_t Rasterizer::Draw(bool is_indexed, u32 index_offset,
     const bool pass_learn = native_pass_learn != 0 && !pipelined;
     // Pause guard (pause_guard.h): in the pause every native/fast path below is off.
     const bool native_off = pass_learn || iss::pause_guard::Blocked();
-    if(!pipelined){DrainDrawPipe(5);SubmitFeedbackBatch(scheduler);PeriodicSubmit(scheduler);}
+    if(!pipelined){DrainDrawPipe(5);SubmitAfterSegments(scheduler);SubmitFeedbackBatch(scheduler);PeriodicSubmit(scheduler);}
     iss::diagnostics::Scope phase_scope(iss::diagnostics::Draw);
     RENDERER_TRACE;
 
@@ -1460,7 +1475,7 @@ std::size_t Rasterizer::Draw(bool is_indexed, u32 index_offset,
     }
 
     if(pipelined && PostDrawPipe(pipeline,false,is_indexed,index_offset))return 0;
-    if(pipelined){DrainDrawPipe(5);SubmitFeedbackBatch(scheduler);scheduler.PopPendingOperations();}
+    if(pipelined){DrainDrawPipe(5);SubmitAfterSegments(scheduler);SubmitFeedbackBatch(scheduler);scheduler.PopPendingOperations();}
     if (!native_off && !iss::native_passes::Enabled() && !pipelined && is_indexed && index_offset == 0 && !following_commands.empty() && native_packet_budget) {
         if (const auto consumed = TryNativeCpuRun(pipeline, following_commands, native_packet_budget)) return consumed;
         if (const auto consumed = TryNativeIndexedRun(pipeline, following_commands, native_packet_budget)) return consumed;
@@ -1538,6 +1553,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline,bool is_indexed,u32
     }
     if (cycles) g_draw_cycles.Mark(7);
 
+    IssCpLayoutCheck(*pipeline, set_writes.data(), u32(set_writes.size()));
     pipeline->BindResources(set_writes, push_data);
     if (cycles) g_draw_cycles.Mark(8);
     UpdateDynamicState(pipeline, is_indexed);
@@ -1645,6 +1661,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline,bool is_indexed,u32
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
+    SubmitAfterSegments(scheduler);
     const iss::cp_path::Scope cp_path_scope{iss::cp_path::DrawIndirect};
     BumpBindEpoch();
     const DrawIndirectParams params = {
@@ -2952,6 +2969,7 @@ struct DispatchCycles {
 static DispatchCycles g_dispatch_cycles;
 
 void Rasterizer::DispatchDirect() {
+    SubmitAfterSegments(scheduler);
     const iss::cp_path::Scope cp_path_scope{iss::cp_path::Dispatch};
     auto& dc = g_dispatch_cycles;
     if (dc.enabled && !OnDrawWorker()) dc.Start();
@@ -3105,6 +3123,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    SubmitAfterSegments(scheduler);
     const iss::cp_path::Scope cp_path_scope{iss::cp_path::Dispatch};
     BumpBindEpoch();
     DrainDrawPipe(5);
@@ -4008,6 +4027,12 @@ u32 g_num_traced_writers = 0;
 #include "native_gbuffer_rasterizer.inl"
 #include "native_passes_rasterizer.inl"
 #include "native_compute_rasterizer.inl"
+
+// steam-deck (diagnostico): checagem de layout do caminho completo do CP (TLG_LAYOUT_CHECK).
+bool IssCpLayoutCheck(const GraphicsPipeline& pipeline, const vk::WriteDescriptorSet* writes, u32 count) {
+    if (!NativeMaterial::LayoutCheckEnabled() || pipeline.UsesPushDescriptors() == false && false) return true;
+    return NativeMaterial::WritesMatchLayout(pipeline, writes, count, pipeline.UsesPushDescriptors() ? "cp-push" : "cp-set");
+}
 
 void Rasterizer::TraceBufferWriters(const Shader::Info& stage) {
     if (g_num_traced_ranges == 0 || g_num_traced_writers >= g_traced_writers.size()) {

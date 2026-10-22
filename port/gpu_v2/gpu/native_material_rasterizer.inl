@@ -91,6 +91,27 @@ static bool WritesMatchLayout(const GraphicsPipeline& pipeline, const vk::WriteD
         }
         return false;
     }
+    // Cada elemento de cada binding do layout coberto por alguma gravacao.
+    for (const auto& lb : layout) {
+        for (u32 e = 0; e < lb.descriptorCount; ++e) {
+            bool covered = false;
+            for (u32 i = 0; i < count && !covered; ++i)
+                covered = writes[i].dstBinding == lb.binding && e >= writes[i].dstArrayElement &&
+                          e < writes[i].dstArrayElement + writes[i].descriptorCount;
+            if (covered) continue;
+            static std::atomic<u32> holes{0};
+            if (holes.fetch_add(1, std::memory_order_relaxed) < 64) {
+                const auto& vs = pipeline.GetStage(Shader::SwStage::Vertex);
+                const auto& ps = pipeline.GetStage(Shader::SwStage::Fragment);
+                std::fprintf(stderr,
+                             "LAYOUT_HOLE %s vs %08llx ps %08llx binding %u elemento %u/%u tipo %d (gravacoes %u,"
+                             " bindings %zu)\n",
+                             where, (unsigned long long)vs.pgm_hash, (unsigned long long)ps.pgm_hash, lb.binding,
+                             e, lb.descriptorCount, int(lb.descriptorType), count, layout.size());
+            }
+            return false;
+        }
+    }
     return true;
 }
 
