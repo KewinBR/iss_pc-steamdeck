@@ -507,7 +507,7 @@ struct Worker {
             // steam-deck: TLG_POOL_NO_RESET=1 (diagnostico) nunca recicla um pool cheio.
             static const bool no_reset = [] {
                 const char* p = std::getenv("TLG_POOL_NO_RESET");
-                return p && p[0] == 1;
+                return p && p[0] == '1';
             }();
             while (!no_reset && !full_pools.empty() && full_pools.front().last_user <= u.seq) {
                 device.resetDescriptorPool(full_pools.front().pool);
@@ -938,7 +938,7 @@ static bool Begin(np::Segment& s, Rec& r, const Template& t) {
     // copiar o secundario pro primario em vez de saltar, e o laudo do RADV_DEBUG=hang mostra os comandos dele).
     static const bool simultaneous = [] {
         const char* p = std::getenv("TLG_PASSES_SIMULTANEOUS");
-        return p && p[0] == 1;
+        return p && p[0] == '1';
     }();
     r.cmd.begin(vk::CommandBufferBeginInfo{
         .flags = (simultaneous ? vk::CommandBufferUsageFlagBits::eSimultaneousUse

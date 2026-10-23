@@ -417,9 +417,20 @@ static ssize_t full_io(int h,void *buffer,uint64_t size,int64_t offset) {
 }
 void runtime_movie_opened(int fd); void runtime_movie_closed(int fd); int runtime_movie_eof(int fd);
 void runtime_movie_note_read(int fd,uint64_t size);
+static const char *fd_path(int fd);
+/* steam-deck (diagnostico do audio das cenas): TLG_READ_TRACE=1 registra cada leitura (fd, arquivo, posicao, tamanho). */
+static void read_trace(int fd,uint64_t size,int64_t offset) {
+    static int on=-1; if (on<0) { const char *e=getenv("TLG_READ_TRACE"); on=e && e[0]==0x31; }
+    if (!on) return;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    const char *p=fd_path(fd);
+    printf("READ %ld.%03ld fd=%d %s off=%lld size=%llu\n",(long)t.tv_sec,t.tv_nsec/1000000,fd,p ? p : "?",(long long)offset,(unsigned long long)size);
+    fflush(stdout);
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     if (runtime_movie_eof(fd)) return 0; /* steam-deck: video pulado */
     runtime_movie_note_read(fd,size);
+    read_trace(fd,size,-1);
     int h=host_fd(fd);
     if (h<0) return -EBADF;
 #ifdef _WIN32
@@ -441,6 +452,7 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     if (runtime_movie_eof(fd)) return 0; /* steam-deck: video pulado */
     runtime_movie_note_read(fd,size);
+    read_trace(fd,size,offset);
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     ssize_t n=full_io(h,buffer,size,offset);

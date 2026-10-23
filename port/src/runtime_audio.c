@@ -176,7 +176,7 @@ static int32_t open_port(int32_t type, uint32_t length, uint32_t freq, uint32_t 
     pthread_mutex_unlock(&table_lock);
     printf("Runtime: audio port %d opened (type %d, %d ch, %s, %u frames%s)\n",id,type,p->channels,p->is_float ? "float" : "s16",length,
            p->downmix ? ", downmixed to stereo" : p->pad_side==2 ? ", pad speaker on the right" :
-           p->pad_side==1 ? ", pad speaker on the left" : "");
+           p->pad_side==1 ? ", pad speaker on the left" : ""); { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); printf("Runtime: audio port open t=%llu ms\n",(unsigned long long)ts.tv_sec*1000+(unsigned long long)(ts.tv_nsec/1000000)); }
     if (runtime_verbose()) printf("Verbose: audio port %d: SDL stream %s, format code %u\n",id,p->stream ? "open" : "none (timer sink)",format);
     return (type<<16) | id | 0x20000000;
 }
@@ -200,6 +200,17 @@ static ABI int32_t audio_close(int32_t handle) {
     pthread_mutex_unlock(&table_lock);
     return p ? 0 : error;
 }
+/* steam-deck: pular video: a porta principal fica muda ate audio_mute_until (CLOCK_MONOTONIC ms) e volta em 0,3 s. */
+static volatile uint64_t audio_mute_until;
+static uint64_t mono_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+(uint64_t)(t.tv_nsec/1000000); }
+void runtime_audio_mute_for(uint64_t ms) { audio_mute_until=mono_ms()+ms; }
+static float audio_mute_gain(const Port *p) {
+    if (p->type!=0 || !audio_mute_until) return 1.0f;
+    const uint64_t now=mono_ms();
+    if (now<audio_mute_until) return 0.0f;
+    if (now<audio_mute_until+300) return (float)(now-audio_mute_until)/300.0f;
+    return 1.0f;
+}
 /* `pace`: wait for this port's next period. sceAudioOutOutputs waits once for all its ports. */
 static int32_t output_port(int32_t handle, const void *data, int pace) {
     int32_t error=0;
@@ -214,10 +225,11 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
         /* Apply per-channel volume and map PS4 8ch (L R C LFE SL SR BL BR) to SDL 7.1 order. */
         unsigned char converted[2048*8*4];
         static const int remap[8]={0,1,2,3,6,7,4,5};
+        const float mute_gain=audio_mute_gain(p); /* steam-deck: pular video */
         for (size_t f=0;f<(size_t)p->frames;++f) for (int c=0;c<p->channels;++c) {
             int target=p->channels==8 && !p->std_layout ? remap[c] : c;
             size_t from=f*(size_t)p->channels+(size_t)c, to=f*(size_t)p->channels+(size_t)target;
-            float gain=(float)p->volume[c]/VOLUME_0DB;
+            float gain=(float)p->volume[c]/VOLUME_0DB*mute_gain;
             if (p->is_float) { float v; memcpy(&v,(const char *)data+from*4,4); v*=gain; memcpy(converted+to*4,&v,4); }
             else { int16_t v; memcpy(&v,(const char *)data+from*2,2); v=(int16_t)((float)v*gain); memcpy(converted+to*2,&v,2); }
         }

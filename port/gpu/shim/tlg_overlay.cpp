@@ -1867,7 +1867,7 @@ std::FILE* File() {
 void Shot(const char* why, float t) {
     static const bool overlays = [] { // TLG_SHOT_OVERLAY=1: o print leva a sobreposicao do port junto (testes)
         const char* p = std::getenv("TLG_SHOT_OVERLAY");
-        return p && p[0] == 1;
+        return p && p[0] == '1';
     }();
     VideoCore::RequestScreenshot(overlays ? VideoCore::ScreenshotRequest::WithOverlays
                                           : VideoCore::ScreenshotRequest::GameOnly);

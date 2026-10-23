@@ -101,13 +101,22 @@ static volatile int movie_fd=-1, movie_skip=0;
 static volatile uint64_t movie_last_other_read, movie_last_decode;
 static uint64_t movie_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+(uint64_t)(t.tv_nsec/1000000); }
 void tlggpu_movie_skip_ui(int state, float progress) __attribute__((weak));
-void runtime_movie_opened(int fd) { movie_fd=fd; movie_skip=0; }
+static uint64_t movie_first_read, movie_bytes, movie_bytes_3s;
+void runtime_audio_mute_for(uint64_t ms) __attribute__((weak));
+void runtime_movie_opened(int fd) { movie_fd=fd; movie_skip=0; movie_first_read=0; movie_bytes=0; movie_bytes_3s=0; }
 void runtime_movie_closed(int fd) { if (fd==movie_fd) { movie_fd=-1; movie_skip=0; } }
 int runtime_movie_eof(int fd) { return movie_skip && fd>=0 && fd==movie_fd; }
 /* Leitura pesada de outro arquivo = carregando: mais de 2 MB em 1,5 s (o audio que toca junto le pouco). */
 void runtime_movie_note_read(int fd, uint64_t size) {
     static uint64_t window_start, bytes;
-    if (fd==movie_fd || movie_fd<0) return;
+    if (fd==movie_fd && movie_fd>=0) { /* quanto do video o jogo ja leu (o audio adiantado vem junto) */
+        const uint64_t t=movie_now_ms();
+        if (!movie_first_read) movie_first_read=t;
+        if (t-movie_first_read<3000) movie_bytes_3s+=size;
+        movie_bytes+=size;
+        return;
+    }
+    if (movie_fd<0) return;
     const uint64_t now=movie_now_ms();
     if (now-window_start>1500) { window_start=now; bytes=0; }
     bytes+=size;
@@ -132,7 +141,22 @@ void runtime_movie_poll(int a_held) {
                 else hold_since=0;
                 if (progress>=1.0f) {
                     movie_skip=1; state=0; engaged=0;
-                    printf("Videodec: video pulado (%s)\n",movie_path);
+                    /* O audio ja lido: bytes lidos / taxa constante (depois dos 3 s do adiantamento inicial) - tocado. */
+                    const uint64_t played=now-movie_first_read;
+                    uint64_t mute=6500;
+                    if (movie_first_read && played>6000 && movie_bytes>movie_bytes_3s) {
+                        const double rate=(double)(movie_bytes-movie_bytes_3s)/(double)(played-3000); /* bytes/ms */
+                        const double ahead=(double)movie_bytes/rate-(double)played;
+                        mute=ahead<1000 ? 1000 : ahead>15000 ? 15000 : (uint64_t)ahead;
+                    }
+                    /* Medido na cena da viatura (23/10): a estimativa deu 12,3 s e o audio da cena acabou em ~6,5 s (o buffer
+                     * de audio do jogo e menor que o de video). Fica a estimativa no log e o mudo em ate 7 s. */
+                    const uint64_t estimate=mute;
+                    mute=mute>7000 ? 7000 : mute;
+                    (void)estimate;
+                    if (runtime_audio_mute_for) runtime_audio_mute_for(mute);
+                    printf("Videodec: audio da cena mudo por %llu ms\n",(unsigned long long)mute);
+                    printf("Videodec: video pulado (%s) t=%llu ms\n",movie_path,(unsigned long long)now);
                     fflush(stdout);
                 }
             }

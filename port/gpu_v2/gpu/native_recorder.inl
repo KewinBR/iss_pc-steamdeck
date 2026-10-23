@@ -181,7 +181,7 @@ struct Worker {
             // steam-deck: TLG_POOL_NO_RESET=1 (diagnostico) nunca recicla um pool cheio.
             static const bool no_reset = [] {
                 const char* p = std::getenv("TLG_POOL_NO_RESET");
-                return p && p[0] == 1;
+                return p && p[0] == '1';
             }();
             while (!no_reset && !full_pools.empty() && full_pools.front().last_user <= r->seq) {
                 device.resetDescriptorPool(full_pools.front().pool);
