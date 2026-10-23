@@ -1040,6 +1040,12 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         if (t->pipeline != shape && !NativeRecorder::InstallViews(*t->pipeline, regs, views, num_views))
             return miss(MissViews);
     }
+    // The template's views as learned: an image freed since may have its views destroyed, and
+    // writing one into the command buffer crashed NVIDIA's driver. The command processor checks
+    // the rest (TexturesValid) before executing the segment.
+    for (const auto& cap : t->images) {
+        if (cap.id && !g.texture_cache->ImageAlive(cap.id, cap.uid)) return miss(MissViews);
+    }
     const auto* pipeline = t->pipeline;
     if (!pipeline->IsReady() || (!pipeline->UsesPushDescriptors() && !NativeMaterial::SetsAt('0')))
         return miss(MissPipeline);

@@ -179,6 +179,13 @@ public:
                    : 0;
     }
 
+    /// iss: whether the image `uid` still lives in slot `image_id` (its views not yet destroyed).
+    /// Lock free: native passes pool threads check it before writing a template's views.
+    [[nodiscard]] bool ImageAlive(ImageId image_id, u64 uid) const noexcept {
+        return image_id.index < NumImageGens &&
+               image_uids[image_id.index].load(std::memory_order_acquire) == uid;
+    }
+
     /// Garbage collector tick, one per guest frame (command processor thread).
     [[nodiscard]] u64 GcTick() const noexcept {
         return gc_tick;
@@ -573,6 +580,7 @@ private:
     }
     static constexpr u32 NumImageGens = 1 << 16;
     std::unique_ptr<std::atomic<u32>[]> image_gens{std::make_unique<std::atomic<u32>[]>(NumImageGens)};
+    std::unique_ptr<std::atomic<u64>[]> image_uids{std::make_unique<std::atomic<u64>[]>(NumImageGens)};
     void BumpImageGeneration(ImageId image_id) noexcept {
         if (image_id.index < NumImageGens) {
             image_gens[image_id.index].fetch_add(1, std::memory_order_release);

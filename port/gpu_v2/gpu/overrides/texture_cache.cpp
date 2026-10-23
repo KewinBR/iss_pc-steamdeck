@@ -7,6 +7,7 @@
 #include <thread>
 #include <unordered_map>
 #include "gpu_blackbox.h"
+#include "native_passes.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1531,6 +1532,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
         std::scoped_lock lru{lru_lock};
         image.lru_id = lru_cache.Insert(image_id, gc_tick);
     }
+    if (image_id.index < NumImageGens)
+        image_uids[image_id.index].store(image.image_uid, std::memory_order_release);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         page_table[page].push_back(image_id);
         page_image_counts[page].fetch_add(1, std::memory_order_release);
@@ -1966,8 +1969,13 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
     }
 
+    // Native passes templates may hold this image's views: clearing its uid makes their pool jobs miss,
+    // and the views go only after the jobs that may have checked before it (native_passes.h).
+    if (image_id.index < NumImageGens) image_uids[image_id.index].store(0);
+    const u64 recording_ticket = iss::native_passes::RecordingTicket();
     // Reclaim image and any image views it references.
-    scheduler.DeferOperation([this, image_id] {
+    scheduler.DeferOperation([this, image_id, recording_ticket] {
+        iss::native_passes::WaitRecordingBefore(recording_ticket);
         Image& image = slot_images[image_id];
         for (auto& backing : image.backing_images) {
             for (const ImageViewId image_view_id : backing.image_view_ids) {
