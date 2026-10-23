@@ -1971,6 +1971,26 @@ namespace SkipImpl {
 std::atomic<int> state{0};
 std::atomic<float> progress{0.0f};
 std::chrono::steady_clock::time_point since{};
+ImTextureData* art = nullptr; // a arte da tela de abertura (Delsin com o Deck) cobrindo a cena pulada
+bool art_tried = false;
+
+// imgui_mutex held, before NewFrame: carrega a arte ao pular e libera quando a cena volta.
+void UpdateArt() {
+    if (state.load() == 3) {
+        if (art || art_tried) return;
+        art_tried = true;
+        TlgPng::Image image;
+        if (const char* p = std::getenv("TLG_LOADING_ART"); p && *p && TlgPng::LoadRgba(p, image))
+            art = StartupImpl::MakeTexture(image);
+    } else {
+        art_tried = false;
+        if (!art) return;
+        art->WantDestroyNextFrame = true;
+        choice_retired.push_back(art);
+        choice_retiring = true;
+        art = nullptr;
+    }
+}
 
 void Draw() {
     const int st = state.load();
@@ -1985,6 +2005,18 @@ void Draw() {
     const ImVec2 c(vp->Size.x - (st == 3 ? 330.0f : 150.0f) * s, vp->Size.y - 48.0f * s);
     if (st == 3) { // pulando: cobre a cena (o jogo segue com legendas e tela escura ate fechar o video)
         dl->AddRectFilled(ImVec2(0, 0), vp->Size, IM_COL32(0, 0, 0, 255));
+        if (art) { // como na tela de abertura: cobre pela altura, recorte puxado pra esquerda, fade de 0,4 s
+            const float W = vp->Size.x, H = vp->Size.y;
+            const float aw = float(art->Width), ah = float(art->Height);
+            const float sc = std::max(H / ah, W / aw);
+            const float vw = W / sc / aw, vh = H / sc / ah;
+            const float u0 = (1.0f - vw) * 0.35f, v0 = (1.0f - vh) * 0.5f;
+            const float a = std::clamp(t / 0.4f, 0.0f, 1.0f);
+            dl->AddImage(art->GetTexRef(), ImVec2(0, 0), ImVec2(W, H), ImVec2(u0, v0), ImVec2(u0 + vw, v0 + vh),
+                         IM_COL32(255, 255, 255, int(a * 255.0f)));
+            dl->AddRectFilledMultiColor(ImVec2(0, H * 0.45f), ImVec2(W, H), IM_COL32(5, 6, 8, 0), IM_COL32(5, 6, 8, 0),
+                                        IM_COL32(5, 6, 8, 214), IM_COL32(5, 6, 8, 214));
+        }
     }
     const char* text = st == 1 ? "CARREGANDO..." : st == 3 ? "PULANDO A CENA..." : "PULAR";
     const float size = 26.0f * s;
@@ -2003,8 +2035,11 @@ void Draw() {
         dl->PathArcTo(c, r, -1.5708f, -1.5708f + p * 6.2832f, 40);
         dl->PathStroke(DeckMenuImpl::Amarelo, 0, 3.0f * s);
     }
-    const ImVec2 a = DeckMenuImpl::Measure(bold, 18.0f * s, "A");
-    dl->AddText(bold, 18.0f * s, ImVec2(c.x - a.x * 0.5f, c.y - a.y * 0.5f), DeckMenuImpl::Branco, "A");
+    // O botao de menu do Deck (tres tracos).
+    for (int i = -1; i <= 1; ++i) {
+        const float y = c.y + float(i) * 4.6f * s;
+        dl->AddLine(ImVec2(c.x - 6.5f * s, y), ImVec2(c.x + 6.5f * s, y), DeckMenuImpl::Branco, 2.0f * s);
+    }
 }
 } // namespace SkipImpl
 #endif
@@ -3562,6 +3597,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     } else if (StartupImpl::art || StartupImpl::logo) {
         StartupImpl::Retire();
     }
+    SkipImpl::UpdateArt();
 #endif
     UpdateChoiceTextures();
     ImGui_ImplVulkan_NewFrame();

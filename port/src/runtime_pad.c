@@ -1075,9 +1075,16 @@ static void sample(PadData *d) {
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
     if (!play_two_finger(d)) play_click(d);
-    { /* steam-deck: pular video segurando o X do PS4 (A no Deck; tambem pelo arquivo de botoes nos testes) */
-        void runtime_movie_poll(int a_held);
-        runtime_movie_poll((d->buttons & BTN_CROSS)!=0);
+    { /* steam-deck: pular video segurando o botao de menu (Options; tambem pelo arquivo de botoes nos testes). Durante o
+       * video ele fica com o pular; solto antes de pular, o jogo recebe um toque (pause). */
+        int runtime_movie_poll(int held);
+        static uint64_t tap_until;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+        const uint64_t now=(uint64_t)ts.tv_sec*1000+(uint64_t)(ts.tv_nsec/1000000);
+        const int r=runtime_movie_poll((d->buttons & BTN_OPTIONS)!=0);
+        if (r) d->buttons&=~(uint32_t)BTN_OPTIONS;
+        if (r==2) tap_until=now+150;
+        if (now<tap_until) d->buttons|=BTN_OPTIONS;
     }
     if (hold_after_capture) {
         if (d->buttons) d->buttons=0;

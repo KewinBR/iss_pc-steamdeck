@@ -94,7 +94,7 @@ static ABI int32_t videodec_create(const ConfigInfo *config, const ResourceInfo 
  * the game fits it to the screen, so it fills it with no bars and no stretching. Every movie is cropped (power
  * previews and in-game TVs too: the Kewin chose immersion); movie_path is kept for the log. */
 static char movie_path[256];
-/* steam-deck: pular video (segurar A). O .bsf aberto agora, a ultima leitura de outro arquivo (o jogo carregando
+/* steam-deck: pular video (segurar o botao de menu). O .bsf aberto agora, a ultima leitura de outro arquivo (o jogo carregando
  * por tras), o ultimo quadro decodificado e o pedido de pular, que faz o .bsf ler fim de arquivo. */
 #include <time.h>
 static volatile int movie_fd=-1, movie_skip=0;
@@ -104,8 +104,10 @@ static uint64_t movie_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONO
 void tlggpu_movie_skip_ui(int state, float progress) __attribute__((weak));
 static uint64_t movie_first_read, movie_bytes, movie_bytes_3s;
 void runtime_audio_mute_for(uint64_t ms) __attribute__((weak));
-void runtime_audio_mute_for(uint64_t ms) __attribute__((weak));
+static char movie_cut_path[256]; /* o video da cena (movie_path e o ultimo .bsf aberto, pode ser uma TV) */
+static volatile uint64_t movie_last_read, movie_mute_min;
 void runtime_movie_opened(int fd) {
+    snprintf(movie_cut_path,sizeof(movie_cut_path),"%s",movie_path);
     /* Um pulo anterior que nao chegou ao fim (o jogo nao leu o controle no carregamento): o audio volta. */
     if (movie_skip && runtime_audio_mute_for) runtime_audio_mute_for(0);
     movie_closed_at=0; movie_fd=fd; movie_skip=0; movie_first_read=0; movie_bytes=0; movie_bytes_3s=0; }
@@ -130,6 +132,7 @@ void runtime_movie_note_read(int fd, uint64_t size) {
         if (!movie_first_read) movie_first_read=t;
         if (t-movie_first_read<3000) movie_bytes_3s+=size;
         movie_bytes+=size;
+        movie_last_read=t;
         return;
     }
     if (movie_fd<0) return;
@@ -138,13 +141,32 @@ void runtime_movie_note_read(int fd, uint64_t size) {
     bytes+=size;
     if (bytes>(2u<<20)) movie_last_other_read=now;
 }
-/* Cada leitura do controle. Estado da tela: 0 nada, 1 carregando, 2 "A Pular" (progress = quanto do anel). */
-void runtime_movie_poll(int a_held) {
-    static int engaged=0, shown=-1;
-    static uint64_t hold_since=0;
+/* Cada leitura do controle, com o botao de menu. Estado da tela: 0 nada, 1 carregando, 2 "Pular" (progress = quanto
+ * do anel), 3 pulando (coberta). Volta 1 se o botao fica com o pular nesta leitura, 2 se foi um toque rapido (menos
+ * de 0,3 s: o jogo recebe o toque e o pause funciona durante o video). */
+int runtime_movie_poll(int a_held) {
+    static int engaged=0, shown=-1, owned=0, skipped=0;
+    static uint64_t hold_since=0, owned_at=0;
     const uint64_t now=movie_now_ms();
-    const int playing=movie_fd>=0 && now-movie_last_decode<1500;
-    if (movie_skip && movie_fd<0) { /* o video ja fechou: segue a cobertura */ }
+    /* Tocando: a cena aberta e sendo lida, quadro novo e o jogo sem desenhar a cena 3D (o video cobre a tela: 1 a 3
+     * desenhos por quadro; o jogo le o video a cada 4 s no maximo). As TVs, a interface e um .bsf de cena aberto durante o jogo nao contam. */
+    const int playing=movie_fd>=0 && now-movie_last_decode<1500 && movie_last_read && now-movie_last_read<8000 &&
+                      (!tlggpu_frame_draws || tlggpu_frame_draws()<100);
+    int ret=0;
+    { static int was; /* o aperto com uma cena aberta vai pro log: o que fez contar como video tocando ou nao */
+        if (a_held && !was && movie_fd>=0) {
+            printf("Videodec: menu apertado: decodificado ha %llu ms, lido ha %llu ms, %llu desenhos, tocando %d\n",
+                   (unsigned long long)(now-movie_last_decode),(unsigned long long)(movie_last_read ? now-movie_last_read : 0),
+                   (unsigned long long)(tlggpu_frame_draws ? tlggpu_frame_draws() : 0),playing);
+            fflush(stdout);
+        }
+        was=a_held;
+    }
+    if (a_held && !owned && playing && !movie_skip) { owned=1; skipped=0; owned_at=now; }
+    if (owned) {
+        if (a_held) ret=1;
+        else { if (!skipped && now-owned_at<300) ret=2; owned=0; }
+    }
     int state=0; float progress=0;
     if (movie_skip) { /* pulada: coberta ate o jogo voltar a desenhar a cena 3D (teto de 90 s) */
         static uint64_t busy_since, last_log;
@@ -164,12 +186,13 @@ void runtime_movie_poll(int a_held) {
             fflush(stdout);
             movie_skip=0; busy_since=0; movie_closed_at=0; state=0;
             /* O audio do video que o jogo ja tinha lido toca ~6,5 s depois do pulo (medido na viatura): o mudo dura
-             * pelo menos ate la, mesmo com a cena de volta. */
+             * pelo menos ate la, mesmo com a cena de volta (8 s, ou 60% da estimativa, ate 12 s: o Kewin ainda ouviu
+             * o fim do audio em alguns pulos). */
             const uint64_t since=now-movie_skip_at;
-            if (runtime_audio_mute_for) runtime_audio_mute_for(since<6500 ? 6500-since : 0);
+            if (runtime_audio_mute_for) runtime_audio_mute_for(since<movie_mute_min ? movie_mute_min-since : 0);
         }
         engaged=0; hold_since=0;
-    } else if (!playing) { engaged=0; hold_since=0; }
+    } else if (!playing || !owned) { engaged=0; hold_since=0; }
     else {
         if (a_held && !engaged) engaged=1;
         if (engaged) {
@@ -180,7 +203,7 @@ void runtime_movie_poll(int a_held) {
                 if (a_held) { if (!hold_since) hold_since=now; progress=(float)(now-hold_since)/1000.0f; }
                 else hold_since=0;
                 if (progress>=1.0f) {
-                    movie_skip=1; engaged=0;
+                    movie_skip=1; engaged=0; skipped=1;
                     /* O audio ja lido: bytes lidos / taxa constante (depois dos 3 s do adiantamento inicial) - tocado. */
                     const uint64_t played=now-movie_first_read;
                     uint64_t mute=6500;
@@ -192,18 +215,20 @@ void runtime_movie_poll(int a_held) {
                     /* Medido na cena da viatura (23/10): a estimativa deu 12,3 s e o audio da cena acabou em ~6,5 s (o buffer
                      * de audio do jogo e menor que o de video). Fica a estimativa no log e o mudo em ate 7 s. */
                     const uint64_t estimate=mute;
-                    (void)estimate;
+                    movie_mute_min=estimate*6/10<8000 ? 8000 : estimate*6/10>12000 ? 12000 : estimate*6/10;
                     mute=90000; /* ate o jogo fechar o video (runtime_movie_closed) */
                     movie_skip_at=now; state=3;
                     if (runtime_audio_mute_for) runtime_audio_mute_for(mute);
                     printf("Videodec: audio da cena mudo por %llu ms\n",(unsigned long long)mute);
-                    printf("Videodec: video pulado (%s) t=%llu ms\n",movie_path,(unsigned long long)now);
+                    printf("Videodec: video pulado (%s) t=%llu ms, estimativa do audio %llu ms\n",movie_cut_path,
+                           (unsigned long long)now,(unsigned long long)estimate);
                     fflush(stdout);
                 }
             }
         }
     }
     if (tlggpu_movie_skip_ui && (state!=shown || state==2)) { tlggpu_movie_skip_ui(state,progress>1.0f ? 1.0f : progress); shown=state; }
+    return ret;
 }
 void runtime_videodec_note_open(const char *guest) {
     const size_t n=guest ? strlen(guest) : 0;
