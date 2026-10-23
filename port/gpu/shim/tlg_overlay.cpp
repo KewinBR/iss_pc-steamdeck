@@ -1982,13 +1982,16 @@ void Draw() {
     ImFont* bold = DeckMenuImpl::font_bold ? DeckMenuImpl::font_bold : reg;
     const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - since).count();
     const float r = 15.0f * s;
-    const ImVec2 c(vp->Size.x - 150.0f * s, vp->Size.y - 48.0f * s);
-    const char* text = st == 1 ? "CARREGANDO..." : "PULAR";
+    const ImVec2 c(vp->Size.x - (st == 3 ? 330.0f : 150.0f) * s, vp->Size.y - 48.0f * s);
+    if (st == 3) { // pulando: cobre a cena (o jogo segue com legendas e tela escura ate fechar o video)
+        dl->AddRectFilled(ImVec2(0, 0), vp->Size, IM_COL32(0, 0, 0, 255));
+    }
+    const char* text = st == 1 ? "CARREGANDO..." : st == 3 ? "PULANDO A CENA..." : "PULAR";
     const float size = 26.0f * s;
     const ImVec2 at(c.x + r + 12.0f * s, c.y - size * 0.55f);
     dl->AddText(bold, size, ImVec2(at.x + 1.5f * s, at.y + 1.5f * s), IM_COL32(0, 0, 0, 160), text);
     dl->AddText(bold, size, at, DeckMenuImpl::Branco, text);
-    if (st == 1) {
+    if (st == 1 || st == 3) {
         dl->PathArcTo(c, r, t * 6.0f, t * 6.0f + 4.4f, 24);
         dl->PathStroke(DeckMenuImpl::Amarelo, 0, 2.6f * s);
         return;

@@ -203,7 +203,7 @@ static ABI int32_t audio_close(int32_t handle) {
 /* steam-deck: pular video: a porta principal fica muda ate audio_mute_until (CLOCK_MONOTONIC ms) e volta em 0,3 s. */
 static volatile uint64_t audio_mute_until;
 static uint64_t mono_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+(uint64_t)(t.tv_nsec/1000000); }
-void runtime_audio_mute_for(uint64_t ms) { audio_mute_until=mono_ms()+ms; }
+void runtime_audio_mute_for(uint64_t ms) { audio_mute_until=mono_ms()+ms; } /* 0: volta ja (com a rampa) */
 static float audio_mute_gain(const Port *p) {
     if (p->type!=0 || !audio_mute_until) return 1.0f;
     const uint64_t now=mono_ms();
