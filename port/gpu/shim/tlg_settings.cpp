@@ -54,7 +54,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         return;
     }
     if (key == "menu_tab") {
-        v.menu_tab = i >= 0 && i <= 3 ? i : 0;
+        v.menu_tab = i >= 0 && i <= 4 ? i : 0;
         return;
     }
     const char* cheat_keys[] = {"cheat_health", "cheat_magic", "cheat_item", "cheat_rage", "cheat_orbs",
@@ -139,6 +139,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.sensor_aim = std::clamp(i, 25, 200);
     } else if (key == "graffiti_guide_seen") {
         v.graffiti_guide_seen = i != 0;
+    } else if (key == "movie_skip") {
+        v.movie_skip = i != 0;
     } else if (key == "display_mode") {
         v.display_mode = TlgGraphics::ParseDisplayMode(value);
     } else if (key == "vsync") {
@@ -265,6 +267,7 @@ void Load() {
         {"TLG_STALE_READBACK", "stale_readback"},     {"TLG_FSR1", "fsr1"},
         {"TLG_RCAS", "rcas"},                        {"TLG_FRAMES_AHEAD", "frames_queued"},
         {"TLG_SHOW_FPS", "show_fps"},             {"TLG_SENSOR_AIM", "sensor_aim"},
+        {"TLG_MOVIE_SKIP", "movie_skip"},
         {"TLG_MOUSE", "mouse_enabled"},           {"TLG_MOUSE_SENS", "mouse_sensitivity"},
         {"TLG_MOUSE_INVERT_Y", "mouse_invert_y"}, {"TLG_MOUSE_SMOOTHING", "mouse_smoothing"},
         {"TLG_MOUSE_ACCEL", "mouse_accel"},       {"TLG_MOUSE_DEADZONE", "mouse_deadzone"},
@@ -405,6 +408,7 @@ void Save() {
                  v.gfx_fov.load(), v.gfx_subtitles.load());
     std::fprintf(file, "sensor_aim=%d\ngraffiti_guide_seen=%d\n", v.sensor_aim.load(),
                  int(v.graffiti_guide_seen.load()));
+    std::fprintf(file, "movie_skip=%d\n", int(v.movie_skip.load()));
     std::fprintf(file,
                  "lod_scale=%.3f\nregion_lod=%.3f\nregion_fade=%.3f\nnear_clip=%.3f\nfar_clip=%.0f\n"
                  "mip_lod_bias=%.3f\nlod_bands=%.0f,%.0f,%.0f,%.0f,%.0f,%.0f\n",
@@ -447,3 +451,8 @@ const char* UpscalerName(int upscaler) {
 }
 
 } // namespace TlgSettings
+
+// steam-deck: o runtime (runtime_videodec.c) pergunta se o pular video esta ligado no menu.
+extern "C" int tlggpu_movie_skip_enabled(void) {
+    return TlgSettings::Get().movie_skip.load(std::memory_order_relaxed) ? 1 : 0;
+}

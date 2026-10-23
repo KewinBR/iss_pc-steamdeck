@@ -701,6 +701,20 @@ void FixesSection() {
 
 void OpenGuide(); // the graffiti guide (below, with the save dialogs)
 
+// steam-deck: recursos que nao fazem parte do jogo original; os experimentais vem desligados.
+void ExtrasTab() {
+    auto& s = TlgSettings::Get();
+    ImGui::SeparatorText("Experimental");
+    if (BeginRows("##extras")) {
+        CheckRow(TL("Skip videos (Experimental)", "Pular vídeos (Experimental)"), s.movie_skip,
+                 TL("During a cutscene video, hold the menu button for 1 s to skip it; a quick tap still pauses. "
+                    "The rest of the scene's audio and subtitles may still play for a few seconds.",
+                    "Durante um vídeo de cena, segure o botão de menu por 1 s para pular; um toque rápido continua "
+                    "pausando. O resto do áudio e das legendas da cena pode tocar por alguns segundos."));
+        ImGui::EndTable();
+    }
+}
+
 void ControlsTab() {
     auto& s = TlgSettings::Get();
     // Mouse (src/runtime_pad.c): the camera settings apply at once. The buttons and the touchpad
@@ -2067,7 +2081,7 @@ void Menu() {
         return;
     }
     footer_help = nullptr;
-    constexpr int TabCount = 4;
+    constexpr int TabCount = 5;
     const ImGuiIO& io = ImGui::GetIO();
     if (!io.WantTextInput) {
         const int step = ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
@@ -2081,7 +2095,7 @@ void Menu() {
     const float footer = ImGui::GetFrameHeightWithSpacing() * 2.0f + ImGui::GetTextLineHeightWithSpacing() * 2.0f;
     if (ImGui::BeginTabBar("##tabs")) {
         static const char* const tabs[TabCount] = {"Overlay", TL("Image", "Imagem"), TL("Performance", "Desempenho"),
-                                                   TL("Controls", "Controle")};
+                                                   TL("Controls", "Controle"), "Extras"};
         for (int tab = 0; tab < TabCount; ++tab) {
             const ImGuiTabItemFlags flags = requested_tab == tab ? ImGuiTabItemFlags_SetSelected : 0;
             if (!ImGui::BeginTabItem(tabs[tab], nullptr, flags)) {
@@ -2096,6 +2110,7 @@ void Menu() {
                 case 1: ImageTab(); break;
                 case 2: PerformanceTab(); break;
                 case 3: ControlsTab(); break;
+                case 4: ExtrasTab(); break;
                 default: OverlayTab(); break;
                 }
             }

@@ -144,7 +144,10 @@ void runtime_movie_note_read(int fd, uint64_t size) {
 /* Cada leitura do controle, com o botao de menu. Estado da tela: 0 nada, 1 carregando, 2 "Pular" (progress = quanto
  * do anel), 3 pulando (coberta). Volta 1 se o botao fica com o pular nesta leitura, 2 se foi um toque rapido (menos
  * de 0,3 s: o jogo recebe o toque e o pause funciona durante o video). */
+int tlggpu_movie_skip_enabled(void) __attribute__((weak));
 int runtime_movie_poll(int a_held) {
+    /* Desligado no menu (aba Extras, padrao): o botao de menu e so do jogo. Um pulo em curso termina normalmente. */
+    if (!movie_skip && !(tlggpu_movie_skip_enabled && tlggpu_movie_skip_enabled())) return 0;
     static int engaged=0, shown=-1, owned=0, skipped=0;
     static uint64_t hold_since=0, owned_at=0;
     const uint64_t now=movie_now_ms();
