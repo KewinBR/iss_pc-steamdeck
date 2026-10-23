@@ -1,3 +1,6 @@
+#include <vector>
+#include <set>
+#include <fstream>
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <cctype>
 #include "tlg_settings.h"
@@ -350,9 +353,38 @@ bool ResolutionNeedsRestart() {
          (v.upscaler == UpscalerTaa) != (v.startup_upscaler == UpscalerTaa));
 }
 
+// steam-deck: chaves do tlg.ini que o menu nao escreve (as do launcher: renderer, native_passes, bpXX) voltam pro
+// arquivo novo; sem isso mexer numa opcao do menu voltava o jogo pro renderer antigo.
+static void KeepForeignKeys(const char* novo, const char* antigo) {
+    auto chave = [](const std::string& linha) {
+        const auto igual = linha.find('=');
+        return linha.empty() || linha[0] == '#' || igual == std::string::npos ? std::string() : linha.substr(0, igual);
+    };
+    std::set<std::string> escritas;
+    std::string linha;
+    {
+        std::ifstream in(novo);
+        while (std::getline(in, linha)) {
+            if (const std::string k = chave(linha); !k.empty()) escritas.insert(k);
+        }
+    }
+    std::vector<std::string> outras;
+    {
+        std::ifstream in(antigo);
+        while (std::getline(in, linha)) {
+            const std::string k = chave(linha);
+            if (!k.empty() && !escritas.count(k)) outras.push_back(linha);
+        }
+    }
+    if (outras.empty()) return;
+    std::ofstream out(novo, std::ios::app);
+    for (const auto& l : outras) out << l << '\n';
+}
+
 void Save() {
     const auto& v = Get();
-    FILE* file = std::fopen(Path(), "w");
+    const std::string novo = std::string(Path()) + ".novo";
+    FILE* file = std::fopen(novo.c_str(), "w");
     if (!file) {
         std::printf("Settings: cannot write %s\n", Path());
         return;
@@ -432,6 +464,8 @@ void Save() {
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");
     std::fclose(file);
+    KeepForeignKeys(novo.c_str(), Path());
+    std::rename(novo.c_str(), Path());
 }
 
 float PresetScale(int preset) {
