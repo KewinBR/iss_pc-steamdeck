@@ -140,6 +140,56 @@ static void *tsc_scan_thread(void *arg) {
 #endif
     return NULL;
 }
+/* steam-deck: TLG_LABEL_WATCH=1 (estudo): a espera do laco principal pelo rotulo da GPU (ver rotulo.py no README). */
+static void *label_watch_thread(void *arg) {
+    (void)arg;
+    const uint64_t base=0x800000000ull;
+    volatile uint32_t *target=(volatile uint32_t *)(uintptr_t)(base+0x7d3cf10+0x1b88);
+    volatile int32_t *index=(volatile int32_t *)(uintptr_t)(base+0x7d3cf10+0x1b8c);
+    volatile uint64_t *table=(volatile uint64_t *)(uintptr_t)(base+0xe17e80);
+    struct timespec nap={0,250000}, first={30,0};
+    nanosleep(&first,NULL); /* o jogo ja carregado */
+    uint64_t sec_start=0, behind_ns=0, last_ns=0, lat_sum=0, lat_max=0;
+    uint32_t last_target=0, targets=0, lat_n=0, gap_max=0;
+    uint32_t pend_target[64]; uint64_t pend_t[64]; unsigned pend_n=0;
+    for (;;) {
+        nanosleep(&nap,NULL);
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+        const uint64_t now=(uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
+        if (!sec_start) { sec_start=now; last_ns=now; continue; }
+        const uint64_t tp=*table;
+        const int32_t idx=*index;
+        if (tp<0x100000000ull || tp>0x7fffffffffffull || (tp&7) || idx<0 || idx>64) { last_ns=now; continue; }
+        const uint32_t tgt=*target, val=*(volatile uint32_t *)(uintptr_t)(tp+(uint64_t)idx*8);
+        if (tgt!=last_target) {
+            ++targets; last_target=tgt;
+            if (pend_n<64) { pend_target[pend_n]=tgt; pend_t[pend_n]=now; ++pend_n; }
+        }
+        for (unsigned i=0;i<pend_n;) {
+            if ((int32_t)(val-pend_target[i])>=0) {
+                const uint64_t l=now-pend_t[i]; lat_sum+=l; if (l>lat_max) lat_max=l; ++lat_n;
+                pend_target[i]=pend_target[pend_n-1]; pend_t[i]=pend_t[pend_n-1]; --pend_n;
+            } else ++i;
+        }
+        if ((int32_t)(tgt-val)>0) { behind_ns+=now-last_ns; if (tgt-val>gap_max) gap_max=tgt-val; }
+        last_ns=now;
+        if (now-sec_start>=1000000000ull) {
+            printf("LABEL_WATCH alvos=%u atras=%.0f%% distancia_max=%u latencia_media=%.1f ms max=%.1f ms (alvo %u rotulo %u idx %d)\n",
+                   targets,100.0*(double)behind_ns/(double)(now-sec_start),gap_max,lat_n ? (double)lat_sum/lat_n/1e6 : 0.0,
+                   (double)lat_max/1e6,tgt,val,idx);
+            fflush(stdout);
+            sec_start=now; behind_ns=0; targets=0; lat_sum=0; lat_max=0; lat_n=0; gap_max=0;
+        }
+    }
+    return NULL;
+}
+static void label_watch_start(void) {
+    static int started;
+    const char *e=getenv("TLG_LABEL_WATCH");
+    if (started || !e || e[0]!='1') return;
+    started=1;
+    pthread_t t; pthread_create(&t,NULL,label_watch_thread,NULL); pthread_detach(t);
+}
 static void tsc_scan_start(void) {
     static int started;
     const char *e=getenv("TLG_TSC_SCAN");
@@ -162,6 +212,7 @@ static ABI uint64_t tsc_frequency(void) {
         tsc_hz=(t1-t0)*1000000000/(ns ? ns : 1);
     }
     tsc_scan_start();
+    label_watch_start();
     { /* steam-deck (experimento): avanco rapido */
         static const char *file; static int checked; static uint64_t last_ns; static int fast; static unsigned scale;
         if (!checked) { checked=1; file=getenv("TLG_FAST_FILE"); const char *e=getenv("TLG_FAST_SCALE"); scale=e ? (unsigned)atoi(e) : 4; if (scale<1) scale=1; }
