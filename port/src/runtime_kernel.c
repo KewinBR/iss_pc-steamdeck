@@ -8,6 +8,7 @@
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <sched.h>
 #include <time.h>
 #include <unistd.h>
@@ -91,13 +92,61 @@ static ABI uint64_t process_time_frequency(void) { return 1000000000; }
  * TLG_TSC=process: the process clock in nanoseconds (upstream gow3_pc 2dea61f), for games that
  * only use the kernel calls on hosts whose rdtsc differs per core (3.9 s apart on a Xeon
  * E5-2680 v4). Per-game choice: the game profile in ps4_core. */
-static uint64_t tsc_hz;
 static int tsc_process_clock(void) {
     static int value=-1;
     if (value<0) { const char *e=getenv("TLG_TSC"); value=e && !strcmp(e,"process"); }
     return value;
 }
 static ABI uint64_t read_tsc(void) { return tsc_process_clock() ? process_time_counter() : __rdtsc(); }
+#include <pthread.h>
+#ifndef _WIN32
+#include <sys/uio.h>
+#endif
+static uint64_t tsc_hz;
+/* steam-deck: TLG_TSC_SCAN=<s> (estudo). */
+static void *tsc_scan_thread(void *arg) {
+    unsigned found=0;
+    const unsigned secs=(unsigned)(uintptr_t)arg;
+    struct timespec nap={(time_t)secs,0};
+    nanosleep(&nap,NULL);
+#ifndef _WIN32
+    const uint64_t ranges[2][2]={{0x400000+0xda0000,0x400000+0x7fa547f},{0x1000000000ull,0x1000000000ull+0x48000000ull}};
+    for (int rg=0; rg<2; ++rg) { const uint64_t lo=ranges[rg][0], hi=ranges[rg][1];
+    const double fd=(double)tsc_hz, inv=1.0/(double)tsc_hz, ms_inv=1000.0/(double)tsc_hz, us_inv=1000000.0/(double)tsc_hz;
+    const float ff=(float)tsc_hz, finv=(float)inv;
+    static unsigned char buf[1<<20];
+    for (uint64_t at=lo; at<hi && found<64; at+=sizeof(buf)) {
+        size_t want=hi-at<sizeof(buf) ? (size_t)(hi-at) : sizeof(buf);
+        struct iovec l={buf,want}, r={(void *)(uintptr_t)at,want};
+        if (process_vm_readv(getpid(),&l,1,&r,1,0)!=(ssize_t)want) continue;
+        for (size_t i=0;i+8<=want;i+=4) {
+            uint64_t u; double d; float f; memcpy(&u,buf+i,8); memcpy(&d,buf+i,8); memcpy(&f,buf+i,4);
+            const char *what=NULL;
+            if (u==tsc_hz) what="u64 freq";
+            else if (d==fd) what="double freq";
+            else if (d!=0 && d==inv) what="double 1/freq";
+            else if (d!=0 && (d>ms_inv*0.999999 && d<ms_inv*1.000001)) what="double 1000/freq";
+            else if (d!=0 && (d>us_inv*0.999999 && d<us_inv*1.000001)) what="double 1e6/freq";
+            else if (f==ff && f>1e8f) what="float freq";
+            else if (f!=0 && f==finv) what="float 1/freq";
+            else if (u==tsc_hz/1000) what="u64 freq/1000";
+            else if (u==tsc_hz/1000000) what="u64 freq/1e6";
+            if (what) { printf("TSC_SCAN %s em 0x%llx (eboot+0x%llx)\n",what,(unsigned long long)(at+i),(unsigned long long)(at+i-0x400000)); ++found; }
+        }
+    }
+    }
+    printf("TSC_SCAN fim: %u achados (freq %llu)\n",found,(unsigned long long)tsc_hz);
+    fflush(stdout);
+#endif
+    return NULL;
+}
+static void tsc_scan_start(void) {
+    static int started;
+    const char *e=getenv("TLG_TSC_SCAN");
+    if (started || !e || !*e) return;
+    started=1;
+    pthread_t t; pthread_create(&t,NULL,tsc_scan_thread,(void *)(uintptr_t)atoi(e)); pthread_detach(t);
+}
 static ABI uint64_t tsc_frequency(void) {
     if (tsc_process_clock()) return 1000000000;
     if (!tsc_hz) {
@@ -111,6 +160,22 @@ static ABI uint64_t tsc_frequency(void) {
         clock_gettime(CLOCK_MONOTONIC,&b); uint64_t t1=__rdtsc();
         uint64_t ns=(uint64_t)(b.tv_sec-a.tv_sec)*1000000000+(uint64_t)(b.tv_nsec-a.tv_nsec);
         tsc_hz=(t1-t0)*1000000000/(ns ? ns : 1);
+    }
+    tsc_scan_start();
+    { /* steam-deck (experimento): avanco rapido */
+        static const char *file; static int checked; static uint64_t last_ns; static int fast; static unsigned scale;
+        if (!checked) { checked=1; file=getenv("TLG_FAST_FILE"); const char *e=getenv("TLG_FAST_SCALE"); scale=e ? (unsigned)atoi(e) : 4; if (scale<1) scale=1; }
+        if (file && *file) {
+            struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+            const uint64_t ns=(uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec;
+            if (ns-last_ns>250000000u) { last_ns=ns; struct stat st; const int now_fast=stat(file,&st)==0;
+                if (now_fast!=fast) { fast=now_fast; printf("TSC_FAST %s (x%u)\n",fast ? "ligado" : "desligado",scale); fflush(stdout); } }
+            if (fast) return tsc_hz/scale;
+        }
+    }
+    { /* steam-deck (estudo): quantas vezes o jogo pede a frequencia (TLG_TSC_SCAN liga a contagem) */
+        static unsigned long calls; ++calls;
+        if (getenv("TLG_TSC_SCAN") && (calls & (calls-1))==0) { printf("TSC_CALLS %lu\n",calls); fflush(stdout); }
     }
     return tsc_hz;
 }
