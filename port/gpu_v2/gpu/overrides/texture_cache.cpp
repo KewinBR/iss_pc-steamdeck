@@ -1759,7 +1759,7 @@ void TextureCache::GarbageCollectImages() {
     // tick_accessed_last but never touched the LRU: under memory pressure the collector deleted
     // textures every frame used, and the guest created and uploaded them again (bursts of 5-30
     // new images a frame, +12 ms frame time spikes while moving, 2026-10-17). Such an image is
-    // moved to the LRU's end instead, except when memory is critical (the aggressive pass).
+    // moved to the LRU's end instead, in the aggressive pass too.
     static const bool recent_use = [] {
         const char* p = std::getenv("ISS_GC_RECENT_USE");
         return !p || p[0] != '0';
@@ -1768,7 +1768,14 @@ void TextureCache::GarbageCollectImages() {
         if (num_deletions == 0) {
             return true;
         }
-        if (recent_use && !aggresive && gc_tick >= ticks_to_destroy &&
+        if (!slot_images.is_allocated(image_id) ||
+            False(slot_images[image_id].flags & ImageFlagBits::Registered)) {
+            return false;
+        }
+        // The aggressive pass spares images in use too: deleting them freed nothing (the
+        // guest created and uploaded them again the same frame) and, with the arena alone
+        // above the critical mark, it ran every frame: stutter at 6.2 GB of 6.4 (RX 6600).
+        if (recent_use && gc_tick >= ticks_to_destroy &&
             ticks_to_destroy < gc_scheduler_ticks.size() && slot_images.is_allocated(image_id)) {
             const u64 used_since =
                 gc_scheduler_ticks[(gc_tick - ticks_to_destroy) % gc_scheduler_ticks.size()];
