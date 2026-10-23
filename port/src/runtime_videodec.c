@@ -104,7 +104,11 @@ static uint64_t movie_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONO
 void tlggpu_movie_skip_ui(int state, float progress) __attribute__((weak));
 static uint64_t movie_first_read, movie_bytes, movie_bytes_3s;
 void runtime_audio_mute_for(uint64_t ms) __attribute__((weak));
-void runtime_movie_opened(int fd) { movie_closed_at=0; movie_fd=fd; movie_skip=0; movie_first_read=0; movie_bytes=0; movie_bytes_3s=0; }
+void runtime_audio_mute_for(uint64_t ms) __attribute__((weak));
+void runtime_movie_opened(int fd) {
+    /* Um pulo anterior que nao chegou ao fim (o jogo nao leu o controle no carregamento): o audio volta. */
+    if (movie_skip && runtime_audio_mute_for) runtime_audio_mute_for(0);
+    movie_closed_at=0; movie_fd=fd; movie_skip=0; movie_first_read=0; movie_bytes=0; movie_bytes_3s=0; }
 static volatile uint64_t movie_skip_at;
 void runtime_movie_closed(int fd) {
     if (fd!=movie_fd) return;
