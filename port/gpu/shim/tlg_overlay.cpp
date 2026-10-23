@@ -713,6 +713,15 @@ void ExtrasTab() {
                     "pausando. O resto do áudio e das legendas da cena pode tocar por alguns segundos."));
         ImGui::EndTable();
     }
+    ImGui::SeparatorText("Easter Eggs");
+    if (BeginRows("##easter")) {
+        CheckRow("Easter Eggs", s.easter_eggs,
+                 TL("Some graffiti of the spray minigame get a surprise. Applies to the graffiti loaded after the "
+                    "change; restart the game to be sure.",
+                    "Alguns grafites do minigame de spray ganham uma surpresa. Vale para os grafites carregados "
+                    "depois da mudança; reinicie o jogo para garantir."));
+        ImGui::EndTable();
+    }
 }
 
 void ControlsTab() {

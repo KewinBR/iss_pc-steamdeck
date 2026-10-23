@@ -89,8 +89,19 @@ struct TexReplacement {
     u32 width, height, levels;
     std::vector<u8> blocks;
 };
+// steam-deck: easter eggs. Each <TLG_TEXTURE_EASTER_DIR>/*.tlgpatch carries only the BC3 blocks that
+// change: "TLGPAT1\0", u64 XXH3 of the guest texture, u32 width, height, levels, then per mip a u32
+// count, that many u32 block indices (linear, row by row) and that many 16-byte blocks. The rest of
+// the texture comes from the game itself (detiled here), so nothing of the game ships with the port.
+// Applied only while the menu's Extras > Easter Eggs is on. Made by ferramentas/tlgpatch.py.
+struct TexPatch {
+    u32 width, height, levels;
+    std::vector<std::vector<u32>> index;
+    std::vector<std::vector<u8>> blocks;
+};
 struct TexReplacements {
     std::unordered_map<u64, TexReplacement> by_hash;
+    std::unordered_map<u64, TexPatch> patches;
     std::set<std::pair<u32, u32>> sizes;
 };
 u64 Bc3ChainBytes(u32 width, u32 height, u32 levels) {
@@ -137,9 +148,99 @@ const TexReplacements& Replacements() {
             }
             std::fclose(f);
         }
+        const char* easter = std::getenv("TLG_TEXTURE_EASTER_DIR");
+        for (const auto& e : std::filesystem::directory_iterator(easter ? easter : "", ec)) {
+            if (e.path().extension() != ".tlgpatch") {
+                continue;
+            }
+            std::FILE* f = std::fopen(e.path().c_str(), "rb");
+            if (!f) {
+                continue;
+            }
+            char magic[8];
+            u64 hash = 0;
+            u32 hdr[3];
+            TexPatch t{};
+            bool ok = std::fread(magic, 1, 8, f) == 8 && !std::memcmp(magic, "TLGPAT1", 8) &&
+                      std::fread(&hash, 8, 1, f) == 1 && std::fread(hdr, 4, 3, f) == 3 && hdr[2] <= 16;
+            if (ok) {
+                t.width = hdr[0];
+                t.height = hdr[1];
+                t.levels = hdr[2];
+                t.index.resize(t.levels);
+                t.blocks.resize(t.levels);
+                for (u32 m = 0; ok && m < t.levels; ++m) {
+                    const u64 nblocks = Bc3ChainBytes(std::max(t.width >> m, 1u),
+                                                      std::max(t.height >> m, 1u), 1) / 16;
+                    u32 n = 0;
+                    ok = std::fread(&n, 4, 1, f) == 1 && n <= nblocks;
+                    if (ok) {
+                        t.index[m].resize(n);
+                        t.blocks[m].resize(u64(n) * 16);
+                        ok = std::fread(t.index[m].data(), 4, n, f) == n &&
+                             std::fread(t.blocks[m].data(), 1, t.blocks[m].size(), f) == t.blocks[m].size();
+                        for (u32 i = 0; ok && i < n; ++i) {
+                            ok = t.index[m][i] < nblocks;
+                        }
+                    }
+                }
+            }
+            std::fclose(f);
+            if (ok) {
+                out.sizes.emplace(t.width, t.height);
+                out.patches.emplace(hash, std::move(t));
+            }
+        }
+        if (!out.patches.empty()) {
+            std::printf("TexReplace: %zu easter egg patches\n", out.patches.size());
+        }
         return out;
     }();
     return r;
+}
+
+// Micro-tiled (Thin1D) BC3 of the guest -> linear blocks of every mip, the same layout the PS4 uses:
+// 8x8 block tiles, rows padded to 8 blocks and each mip to a multiple of 256 bytes. Returns false if
+// that layout does not add up to the guest size (another tiling): then the texture stays untouched.
+bool DetileBc3Chain(const u8* guest, u32 guest_size, u32 width, u32 height, u32 pitch, u32 levels,
+                    std::vector<u8>& out) {
+    u64 tiled = 0;
+    for (u32 m = 0; m < levels; ++m) {
+        const u32 pb = Common::DivCeil(std::max(pitch >> m, 1u), 4u);
+        const u32 hb = Common::DivCeil(std::max(height >> m, 1u), 4u);
+        u64 pa = (pb + 7) & ~7u;
+        const u64 ha = (hb + 7) & ~7u;
+        while ((pa * ha * 16) % 256) {
+            pa += 8;
+        }
+        tiled += pa * ha * 16;
+    }
+    if (tiled != guest_size) {
+        return false;
+    }
+    out.resize(Bc3ChainBytes(width, height, levels));
+    u64 src = 0, dst = 0;
+    for (u32 m = 0; m < levels; ++m) {
+        const u32 pb = Common::DivCeil(std::max(pitch >> m, 1u), 4u);
+        const u32 hb = Common::DivCeil(std::max(height >> m, 1u), 4u);
+        const u32 wb = Common::DivCeil(std::max(width >> m, 1u), 4u);
+        u64 pa = (pb + 7) & ~7u;
+        const u64 ha = (hb + 7) & ~7u;
+        while ((pa * ha * 16) % 256) {
+            pa += 8;
+        }
+        for (u32 y = 0; y < hb; ++y) {
+            for (u32 x = 0; x < wb; ++x) {
+                const u32 e = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) |
+                              ((y & 4) << 3);
+                const u64 tile = u64(y / 8) * (pa / 8) + x / 8;
+                std::memcpy(out.data() + dst + (u64(y) * wb + x) * 16, guest + src + (tile * 64 + e) * 16, 16);
+            }
+        }
+        src += pa * ha * 16;
+        dst += u64(wb) * hb * 16;
+    }
+    return true;
 }
 } // namespace
 
@@ -1314,10 +1415,12 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return FindViewMemoized(image_id, desc.view_info, false);
 }
 
+extern "C" int tlggpu_easter_eggs_enabled(void);
+
 bool TextureCache::ReplaceImage(Image& image) {
     const TexReplacements& reps = Replacements();
     const ImageInfo& info = image.info;
-    if (reps.by_hash.empty() || !info.props.is_block ||
+    if ((reps.by_hash.empty() && reps.patches.empty()) || !info.props.is_block ||
         info.resources.layers != 1 || !reps.sizes.contains({info.size.width, info.size.height})) {
         return false;
     }
@@ -1325,6 +1428,52 @@ bool TextureCache::ReplaceImage(Image& image) {
         return false;
     }
     const u64 hash = XXH3_64bits(std::bit_cast<const u8*>(info.guest_address), info.guest_size);
+    if (const auto p = reps.patches.find(hash); p != reps.patches.end()) {
+        const TexPatch& t = p->second;
+        const u32 levels = info.resources.levels;
+        std::vector<u8> linear;
+        if (!tlggpu_easter_eggs_enabled() || t.width != info.size.width || t.height != info.size.height ||
+            t.levels < levels ||
+            !DetileBc3Chain(std::bit_cast<const u8*>(info.guest_address), info.guest_size, t.width,
+                            t.height, info.pitch, levels, linear)) {
+            return false;
+        }
+        boost::container::small_vector<vk::BufferImageCopy, 14> copies;
+        const auto staging = runtime.GetStagingPool().Request(linear.size(), MemoryType::HostUncached, 16);
+        u8* dst = static_cast<u8*>(staging.mapped);
+        std::memcpy(dst, linear.data(), linear.size());
+        u64 offset = 0;
+        for (u32 m = 0; m < levels; ++m) {
+            const u32 width = std::max(t.width >> m, 1u);
+            const u32 height = std::max(t.height >> m, 1u);
+            for (u64 i = 0; i < t.index[m].size(); ++i) {
+                std::memcpy(dst + offset + u64(t.index[m][i]) * 16, t.blocks[m].data() + i * 16, 16);
+            }
+            copies.push_back({
+                .bufferOffset = staging.offset + offset,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource{
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = m,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {width, height, 1},
+            });
+            offset += Bc3ChainBytes(width, height, 1);
+        }
+        staging.Flush();
+        scheduler.EndRendering();
+        runtime.UploadImage(&image, staging.buffer, copies);
+        static std::set<u64> shown_patch;
+        if (shown_patch.insert(hash).second) {
+            std::printf("TexReplace: easter egg %ux%u at %llx\n", t.width, t.height,
+                        static_cast<unsigned long long>(info.guest_address));
+        }
+        return true;
+    }
     const auto it = reps.by_hash.find(hash);
     if (it == reps.by_hash.end()) {
         static std::set<u64> logged; // tamanho de uma troca, outro conteúdo: o hash pra fazer outra
