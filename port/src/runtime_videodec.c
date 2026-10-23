@@ -159,7 +159,10 @@ void runtime_movie_poll(int a_held) {
             printf("Videodec: cena encerrada %llu ms depois do pulo\n",(unsigned long long)(now-movie_skip_at));
             fflush(stdout);
             movie_skip=0; busy_since=0; movie_closed_at=0; state=0;
-            if (runtime_audio_mute_for) runtime_audio_mute_for(0);
+            /* O audio do video que o jogo ja tinha lido toca ~6,5 s depois do pulo (medido na viatura): o mudo dura
+             * pelo menos ate la, mesmo com a cena de volta. */
+            const uint64_t since=now-movie_skip_at;
+            if (runtime_audio_mute_for) runtime_audio_mute_for(since<6500 ? 6500-since : 0);
         }
         engaged=0; hold_since=0;
     } else if (!playing) { engaged=0; hold_since=0; }
