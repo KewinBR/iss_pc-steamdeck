@@ -177,10 +177,7 @@ static int32_t picture(Decoder *d, FrameBuffer *buffer, PictureInfo *info) {
         static int logged;
         if (!logged) { logged=1; printf("Videodec: full-screen movie cropped to 16:10 (%ux%u, %s)\n",width,height,movie_path); }
     }
-    /* steam-deck: com o corte 16:10 a largura (1728) da um pitch de croma (864 elementos RG8) fora do multiplo de 64
-     * que a textura linear do GCN pede; suspeita da faixa esticada no topo dos videos no renderer v2. O pitch vai pra
-     * multiplo de 128 bytes (croma em multiplo de 64 elementos) e a largura continua a mesma (crop_right cobre). */
-    uint32_t pitch=align(width,crop_1610() ? 128 : 64), rows=align(height,16);
+    uint32_t pitch=align(width,64), rows=align(height,16);
     if ((uint64_t)pitch*rows*3/2>buffer->frame_buffer_size) return ERR_FRAME_BUFFER_SIZE;
     unsigned char *luma=buffer->frame_buffer, *chroma=luma+(size_t)pitch*rows;
     for (uint32_t y=0;y<rows;++y) {
