@@ -1886,7 +1886,33 @@ void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage() && !GcTextureOnly()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
-    if (total_used_memory < trigger_gc_memory) {
+    // steam-deck: guarda da memoria do sistema. No Deck a GTT sai da RAM: com o jogo em ~4 GB de RAM e ~8,8 GB de
+    // GTT sobravam ~500 MB, e o menu da Steam travou o gamescope esperando memoria (2026-10-24). Abaixo de
+    // ISS_GC_MIN_FREE_MB livres (MemAvailable, padrao 1536) o coletor apaga texturas fora de uso como no limite
+    // critico, ate a memoria livre voltar; as que estao em uso continuam poupadas.
+    static const u64 min_free_mb = [] {
+        const char* p = std::getenv("ISS_GC_MIN_FREE_MB");
+        return p && *p ? u64(std::strtoull(p, nullptr, 10)) : u64(1536);
+    }();
+    static bool low_memory = false;
+    if (min_free_mb && gc_tick % 30 == 0) {
+        u64 avail_kb = 0;
+        if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+            char line[128];
+            while (std::fgets(line, sizeof(line), f)) {
+                if (std::sscanf(line, "MemAvailable: %llu kB", reinterpret_cast<unsigned long long*>(&avail_kb)) == 1)
+                    break;
+            }
+            std::fclose(f);
+        }
+        const bool low = avail_kb && avail_kb / 1024 < min_free_mb;
+        if (low != low_memory) {
+            low_memory = low;
+            std::fprintf(stderr, "MEM_GUARD %s: livre=%llu MB, texturas=%llu MB\n", low ? "liga" : "desliga",
+                         (unsigned long long)(avail_kb / 1024), (unsigned long long)(total_used_memory >> 20));
+        }
+    }
+    if (total_used_memory < trigger_gc_memory && !low_memory) {
         return;
     }
     std::scoped_lock lock{mutex};
@@ -1896,8 +1922,8 @@ void TextureCache::GarbageCollectImages() {
     size_t num_deletions = 0;
 
     const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_memory >= pressure_gc_memory;
-        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
+        pressured = total_used_memory >= pressure_gc_memory || low_memory;
+        aggresive = allow_aggressive && (total_used_memory >= critical_gc_memory || low_memory);
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
@@ -1952,7 +1978,7 @@ void TextureCache::GarbageCollectImages() {
             DownloadImageMemory(image_id);
         }
         FreeImage(image_id);
-        if (total_used_memory < critical_gc_memory) {
+        if (total_used_memory < critical_gc_memory && !low_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
                 aggresive = false;
@@ -1971,7 +1997,7 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
-    if (total_used_memory >= critical_gc_memory) {
+    if (total_used_memory >= critical_gc_memory || low_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
