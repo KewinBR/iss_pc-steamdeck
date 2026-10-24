@@ -338,6 +338,7 @@ static void load_button_maps(void) {
  *   A notice on screen tells the mode; leaving it puts the controller upright again.
  * TLG_MOTION=off disables real sensors (simulation still works). */
 static int injected_motion; /* TLG_PAD_FILE tokens: 1 tilt_right (T), 2 tilt_left (G), 4 shake (Y) */
+static int injected_view; /* TLG_PAD_FILE token "view": the Deck's View button (opens the port menu) */
 typedef struct { float w, x, y, z; } Quat;
 static struct { Quat q; float roll, pitch, yaw, aim_pitch; uint64_t last_us; int sensors, warned, mode, toggle_held; } motion={{1,0,0,0},0,0,0,0,0,-1,0,0,0};
 static Quat quat_mul(Quat a, Quat b) {
@@ -761,7 +762,7 @@ static void sample_host(PadData *d) {
     if (deck_view_menu()) {
         static bool view_prev;
         static uint64_t closed_at;
-        const bool view=g && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_BACK);
+        const bool view=(g && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_BACK)) || injected_view;
         if (view && !view_prev && !tlggpu_overlay_menu_open() && now_us()>closed_at+400000) {
             view_prev=true;
             tlggpu_set_guest_paused(1);
@@ -903,6 +904,7 @@ static void read_inject(void) {
     static const char *sticks[]={"lx=","ly=","rx=","ry="};
     injected.buttons=0;
     injected_motion=0;
+    injected_view=0;
     for (int i=0;i<4;++i) injected.stick[i]=-1;
     char token[64];
     while (fscanf(f,"%63s",token)==1) {
@@ -911,6 +913,7 @@ static void read_inject(void) {
         if (!strcmp(token,"tilt_right")) injected_motion|=1;
         if (!strcmp(token,"tilt_left")) injected_motion|=2;
         if (!strcmp(token,"shake")) injected_motion|=4;
+        if (!strcmp(token,"view")) injected_view=1;
         for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }
     }
     fclose(f);

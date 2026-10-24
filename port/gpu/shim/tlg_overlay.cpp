@@ -861,28 +861,30 @@ double dialog_at = 0.0;
 std::atomic<bool> close_request{false}; // View com o menu aberto (thread da janela)
 struct Snapshot {
     int preset, resolution, distance, shadows, particles, fov, subtitles;
-    bool motion_blur, ssr, unlock, fps;
+    bool motion_blur, ssr, unlock, fps, movie, easter;
 };
 Snapshot snap{};
 Snapshot Take() {
     const auto& s = TlgSettings::Get();
     return {s.gfx_preset, s.gfx_resolution, s.gfx_distance, s.gfx_shadows, s.particles, s.gfx_fov,
-            s.gfx_subtitles, s.gfx_motion_blur, s.gfx_ssr, s.gfx_unlock_fps, s.show_fps};
+            s.gfx_subtitles, s.gfx_motion_blur, s.gfx_ssr, s.gfx_unlock_fps, s.show_fps, s.movie_skip,
+            s.easter_eggs};
 }
 void Restore(const Snapshot& v) {
     auto& s = TlgSettings::Get();
     s.gfx_preset = v.preset; s.gfx_resolution = v.resolution; s.gfx_distance = v.distance;
     s.gfx_shadows = v.shadows; s.particles = v.particles; s.gfx_fov = v.fov; s.gfx_subtitles = v.subtitles;
     s.gfx_motion_blur = v.motion_blur; s.gfx_ssr = v.ssr; s.gfx_unlock_fps = v.unlock; s.show_fps = v.fps;
+    s.movie_skip = v.movie; s.easter_eggs = v.easter;
 }
-// Mudou alguma coisa? (restart: só as que valem na próxima abertura; Mostrar FPS vale na hora)
+// Mudou alguma coisa? (restart: só as que valem na próxima abertura; Mostrar FPS e os Extras valem na hora)
 bool Changed(bool restart_only) {
     const Snapshot n = Take();
     const bool gfx = n.preset != snap.preset || n.resolution != snap.resolution || n.distance != snap.distance ||
                      n.shadows != snap.shadows || n.particles != snap.particles || n.fov != snap.fov ||
                      n.subtitles != snap.subtitles ||
                      n.motion_blur != snap.motion_blur || n.ssr != snap.ssr || n.unlock != snap.unlock;
-    return gfx || (!restart_only && n.fps != snap.fps);
+    return gfx || (!restart_only && (n.fps != snap.fps || n.movie != snap.movie || n.easter != snap.easter));
 }
 bool CanRestart() {
     const char* c = std::getenv("TLG_RESTART_COMMAND");
@@ -922,8 +924,8 @@ int sel = -1;
 float scroll = 0.0f, scroll_target = 0.0f;
 double tab_changed_at = -10.0, l1_at = -10.0, r1_at = -10.0, sel_changed_at = -10.0;
 int prev_tab = 0;
-std::array<std::array<double, 32>, 3> value_changed{}; // pop do valor, por aba e item
-std::array<std::array<double, 32>, 3> switch_changed{};
+std::array<std::array<double, 32>, 4> value_changed{}; // pop do valor, por aba e item
+std::array<std::array<double, 32>, 4> switch_changed{};
 
 float Ease(float t) {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -1041,6 +1043,22 @@ std::vector<Item> Build(int which) {
                      TL("With the Steam menu open the game stays still, like the PS button on a PS4.",
                         "Com o menu da Steam aberto o jogo fica parado, como o botão PS no PS4."),
                      nullptr, nullptr, 0, nullptr, TL("Freezes the game", "Congela o jogo")});
+    } else if (which == 2) {
+        // steam-deck: recursos que nao fazem parte do jogo original; vem desligados.
+        v.push_back({Kind::Section, TL("Experimental", "Experimental")});
+        v.push_back({Kind::Switch, TL("Skip videos", "Pular vídeos"),
+                     TL("During a cutscene video, hold the menu button for 1 s to skip it; a quick tap still pauses. "
+                        "The rest of the scene's audio and subtitles may still play for a few seconds.",
+                        "Durante um vídeo de cena, segure o botão de menu por 1 s para pular; um toque rápido continua "
+                        "pausando. O resto do áudio e das legendas da cena pode tocar por alguns segundos."),
+                     nullptr, nullptr, 0, &s.movie_skip});
+        v.push_back({Kind::Section, "Easter Eggs"});
+        v.push_back({Kind::Switch, "Easter Eggs",
+                     TL("Some graffiti of the spray minigame get a surprise. Applies to the graffiti loaded after the "
+                        "change; restart the game to be sure.",
+                        "Alguns grafites do minigame de spray ganham uma surpresa. Vale para os grafites carregados "
+                        "depois da mudança; reinicie o jogo para garantir."),
+                     nullptr, nullptr, 0, &s.easter_eggs});
     } else {
         v.push_back({Kind::Section, "Port"});
         v.push_back({Kind::Fixed, TL("Edition", "Edição"),
@@ -1238,6 +1256,11 @@ void Draw() {
         dialog = 0;
         close_request = false;
         closing_at = -1.0;
+        // Testes: TLG_MENU_TAB=n abre o menu nessa aba (print do menu sem ninguem no controle).
+        if (const char* p = std::getenv("TLG_MENU_TAB"); p && *p) {
+            tab = std::clamp(std::atoi(p), 0, 3);
+            sel = -1;
+        }
     }
     last_draw = now;
     io.MouseDrawCursor = false;
@@ -1250,10 +1273,10 @@ void Draw() {
     const float fade = std::clamp((t - 0.15f) / 0.15f, 0.0f, 1.0f);
 
     // Entrada do teclado/controle.
-    static const char* const tab_names_pt[] = {"Gráficos", "Controle", "Sobre"};
-    static const char* const tab_names_en[] = {"Graphics", "Controls", "About"};
+    static const char* const tab_names_pt[] = {"Gráficos", "Controle", "Extras", "Sobre"};
+    static const char* const tab_names_en[] = {"Graphics", "Controls", "Extras", "About"};
     const char* const* tab_names = pt ? tab_names_pt : tab_names_en;
-    constexpr int TabCount = 3;
+    constexpr int TabCount = 4;
     auto items = Build(tab);
     if (sel < 0 || sel >= int(items.size()) || items[sel].kind == Kind::Section) {
         sel = FirstSelectable(items);
@@ -1415,6 +1438,7 @@ void Draw() {
         up = Upper(up.c_str());
         if (tab == 0) up = TL("OPTIONS", "OPÇÕES");
         else if (tab == 1) up = TL("CONTROLS", "CONTROLE");
+        else if (tab == 2) up = "EXTRAS";
         else up = TL("ABOUT", "SOBRE");
         Text(dl, bold, 5.4f * u, ImVec2(px, py), Alpha(Amarelo, fade), up.c_str());
 
