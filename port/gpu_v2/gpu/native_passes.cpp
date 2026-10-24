@@ -199,6 +199,8 @@ const bool predict_latest = [] {
 std::mutex lanes_mutex;
 std::unordered_map<CommandBuffer*, std::unique_ptr<Lane>> lanes;
 std::vector<Lane*> all_lanes;
+// steam-deck (diagnostico de memoria 2026-10-24): segmentos criados (cada um com um secundario no pool da lane).
+std::atomic<unsigned long long> segments_allocated{0};
 // The engine's chunk callback (one function for all its command buffers).
 std::atomic<Reserve> engine_reserve{};
 
@@ -267,6 +269,7 @@ Segment* TakeSegment(Lane& l) {
             return nullptr;
         }
         s = new Segment;
+        segments_allocated.fetch_add(1, std::memory_order_relaxed);
     }
     s->kind = Kind::Segment;
     s->token = l.tag;
@@ -1854,6 +1857,8 @@ void Report() {
         std::fprintf(stderr, "NATIVE_INDIRECT seen=%llu recorded=%llu\n",
                      (unsigned long long)s.indirect_seen.load(),
                      (unsigned long long)s.indirect_recorded.load());
+    std::fprintf(stderr, "NATIVE_PASSES_MEM lanes=%zu segments_allocated=%llu\n", all_lanes.size(),
+                 segments_allocated.load(std::memory_order_relaxed));
     std::fprintf(stderr, "NATIVE_PASSES_LANES restarts=%llu unknown_draws=%llu no_segment=%llu learn_deduped=%llu closed_inside=%llu unknown[%s ]\n",
                  (unsigned long long)s.restarts.load(), (unsigned long long)s.unknown_draws.load(),
                  (unsigned long long)s.no_segment.load(),

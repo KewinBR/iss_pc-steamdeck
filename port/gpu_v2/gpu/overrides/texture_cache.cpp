@@ -1921,12 +1921,23 @@ void TextureCache::GarbageCollectImages() {
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
 
+    // Guarda da memoria do sistema sem pressao das texturas: so as paradas ha ~20 s (600 ticks), 10 por vez, e
+    // nunca abaixo de 512 MB de texturas. A primeira versao entrava no modo critico e apagou 231 mil texturas em uso
+    // numa sessao de batalhas (o jogo recriava na hora: engasgos de 50+ ms, 2026-10-24).
+    const bool guard_only = low_memory && total_used_memory < trigger_gc_memory;
+    if (guard_only && total_used_memory < (512ull << 20)) {
+        return;
+    }
     const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_memory >= pressure_gc_memory || low_memory;
-        aggresive = allow_aggressive && (total_used_memory >= critical_gc_memory || low_memory);
+        pressured = total_used_memory >= pressure_gc_memory;
+        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
-        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        if (guard_only) {
+            ticks_to_destroy = 600;
+            num_deletions = 10;
+        }
+        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
     };
     // ISS_GC_RECENT_USE (default on): an image bound since the oldest gc tick the collector may
     // delete is in use, whatever its LRU position says. The draw paths that skip FindImage (the
@@ -1978,7 +1989,10 @@ void TextureCache::GarbageCollectImages() {
             DownloadImageMemory(image_id);
         }
         FreeImage(image_id);
-        if (total_used_memory < critical_gc_memory && !low_memory) {
+        if (guard_only && total_used_memory < (512ull << 20)) {
+            return true;
+        }
+        if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
                 aggresive = false;
@@ -1997,7 +2011,7 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
-    if (total_used_memory >= critical_gc_memory || low_memory) {
+    if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
