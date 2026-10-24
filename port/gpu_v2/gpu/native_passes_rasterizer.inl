@@ -1525,6 +1525,19 @@ static void Abandon(np::Segment&) {
     // the secondary is reset when the segment is reused.
 }
 
+// steam-deck: o secundario de um segmento de reserva volta pro driver (ver ISS_PASSES_SPARE_KEEP em
+// native_passes.cpp). So segmentos aposentados chegam aqui (executados e fora do anel, ou abandonados), sob o lock da
+// lane, o mesmo que guarda o pool.
+static void Release(np::Segment& s) {
+    auto* r = static_cast<Rec*>(s.recording);
+    auto* lane = s.lane_user ? static_cast<LanePool*>(*s.lane_user) : nullptr;
+    if (!r || !r->cmd || !lane || r->begun) return;
+    g.instance->GetDevice().freeCommandBuffers(lane->pool, 1, &r->cmd);
+    r->cmd = vk::CommandBuffer{};
+    r->needs_reset = false;
+    r->exec_tick = 0;
+}
+
 static bool Retired(const np::Segment& s) {
     const u32 state = s.state.load(std::memory_order_acquire);
     if (state == np::Abandoned || state == np::Free) return true;
@@ -1716,6 +1729,7 @@ void Rasterizer::NativePassesSetup() {
     callbacks.close = &Close;
     callbacks.abandon = &Abandon;
     callbacks.retired = &Retired;
+    callbacks.release = &Release;
     callbacks.unlearnable = &IsUnlearnable;
     callbacks.report = &Report;
     NativeCompute::Install(callbacks);

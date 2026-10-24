@@ -201,6 +201,18 @@ std::unordered_map<CommandBuffer*, std::unique_ptr<Lane>> lanes;
 std::vector<Lane*> all_lanes;
 // steam-deck (diagnostico de memoria 2026-10-24): segmentos criados (cada um com um secundario no pool da lane).
 std::atomic<unsigned long long> segments_allocated{0};
+std::atomic<unsigned long long> segments_released{0};
+// steam-deck: ISS_PASSES_SPARE_KEEP (padrao 2048): segmentos de reserva por lane que guardam o secundario. Acima disso
+// o secundario volta pro driver. Sem isso, cada pico de segmentos (cenas pesadas, video) ficava com a memoria dos
+// secundarios presa pra sempre: ~50 KB cada, 36 mil numa sessao, ~3 GB de GTT, e o menu da Steam travava o Deck sem
+// memoria (2026-10-24).
+size_t SpareKeep() {
+    static const size_t keep = [] {
+        const char* p = std::getenv("ISS_PASSES_SPARE_KEEP");
+        return p && *p ? size_t(std::strtoull(p, nullptr, 10)) : size_t(2048);
+    }();
+    return keep;
+}
 // The engine's chunk callback (one function for all its command buffers).
 std::atomic<Reserve> engine_reserve{};
 
@@ -257,6 +269,10 @@ Segment* TakeSegment(Lane& l) {
         if (state == Done && !cb.retired(*s)) break;
         l.segments.pop_front();
         s->state.store(Free, std::memory_order_relaxed);
+        if (cb.release && l.spare.size() >= SpareKeep() && s->kind == Kind::Segment) {
+            cb.release(*s);
+            segments_released.fetch_add(1, std::memory_order_relaxed);
+        }
         l.spare.push_back(s);
     }
     Segment* s;
@@ -1857,8 +1873,9 @@ void Report() {
         std::fprintf(stderr, "NATIVE_INDIRECT seen=%llu recorded=%llu\n",
                      (unsigned long long)s.indirect_seen.load(),
                      (unsigned long long)s.indirect_recorded.load());
-    std::fprintf(stderr, "NATIVE_PASSES_MEM lanes=%zu segments_allocated=%llu\n", all_lanes.size(),
-                 segments_allocated.load(std::memory_order_relaxed));
+    std::fprintf(stderr, "NATIVE_PASSES_MEM lanes=%zu segments_allocated=%llu secondaries_released=%llu\n",
+                 all_lanes.size(), segments_allocated.load(std::memory_order_relaxed),
+                 segments_released.load(std::memory_order_relaxed));
     std::fprintf(stderr, "NATIVE_PASSES_LANES restarts=%llu unknown_draws=%llu no_segment=%llu learn_deduped=%llu closed_inside=%llu unknown[%s ]\n",
                  (unsigned long long)s.restarts.load(), (unsigned long long)s.unknown_draws.load(),
                  (unsigned long long)s.no_segment.load(),

@@ -136,6 +136,9 @@ struct Callbacks {
     void (*abandon)(Segment& segment);
     /// Whether the segment's recording is reusable (executed and retired, or abandoned).
     bool (*retired)(const Segment& segment);
+    /// steam-deck: frees the retired segment's secondary (its memory goes back to the driver); the
+    /// segment stays, and gets a new secondary if it is used again.
+    void (*release)(Segment& segment);
     /// Whether the command processor gave up learning this key.
     bool (*unlearnable)(u64 key);
     /// Periodic report (any thread).
