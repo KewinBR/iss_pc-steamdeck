@@ -1038,7 +1038,7 @@ std::vector<Item> Build(int which) {
         v.push_back({Kind::Section, TL("Buttons", "Botões")});
         v.push_back({Kind::Fixed, TL("View button", "Botão View"),
                      TL("Opens and closes this menu with the game frozen.", "Abre e fecha este menu com o jogo congelado."),
-                     nullptr, nullptr, 0, nullptr, TL("Port menu", "Menu do port")});
+                     nullptr, nullptr, 0, nullptr, TL("Deckport menu", "Menu do Deckport")});
         v.push_back({Kind::Fixed, TL("Steam button", "Botão Steam"),
                      TL("With the Steam menu open the game stays still, like the PS button on a PS4.",
                         "Com o menu da Steam aberto o jogo fica parado, como o botão PS no PS4."),
@@ -1060,21 +1060,21 @@ std::vector<Item> Build(int which) {
                         "depois da mudança; reinicie o jogo para garantir."),
                      nullptr, nullptr, 0, &s.easter_eggs});
     } else {
-        v.push_back({Kind::Section, "Port"});
-        v.push_back({Kind::Fixed, TL("Edition", "Edição"),
-                     TL("The native inFAMOUS Second Son port tuned for the Steam Deck: 16:10 full screen, Deck controls, its own menu and performance work.",
-                        "Port nativo do inFAMOUS Second Son ajustado pro Steam Deck: tela cheia 16:10, controles do Deck, menu próprio e otimizações de desempenho."),
+        v.push_back({Kind::Section, "Deckport"});
+        v.push_back({Kind::Fixed, "Deckport",
+                     TL("Deckport is the native inFAMOUS Second Son port tuned for the Steam Deck: 16:10 full screen, Deck controls, its own menu and performance work.",
+                        "O Deckport é o port nativo do inFAMOUS Second Son ajustado pro Steam Deck: tela cheia 16:10, controles do Deck, menu próprio e otimizações de desempenho."),
                      nullptr, nullptr, 0, nullptr, "Steam Deck",
                      {{TL("Screen", "Tela"), TL("1280x800, no bars", "1280x800 sem barras"), 0},
                       {TL("Controls", "Controles"), TL("trackpads, gyroscope, shake", "trackpads, giroscópio, chacoalhar"), 0}}});
-        v.push_back({Kind::Fixed, TL("Original port", "Port original"),
-                     TL("The native port this edition builds on: iss_pc, by HayatoG. It runs the game directly on the processor, with graphics adapted from the shadPS4 emulator.",
-                        "O port nativo em que esta edição se baseia: iss_pc, de HayatoG. Roda o jogo direto no processador, com a parte gráfica adaptada do emulador shadPS4."),
+        v.push_back({Kind::Fixed, TL("Based on", "Baseado em"),
+                     TL("The native port Deckport builds on: iss_pc, by HayatoG. It runs the game directly on the processor, with graphics adapted from the shadPS4 emulator.",
+                        "O port nativo em que o Deckport se baseia: iss_pc, de HayatoG. Roda o jogo direto no processador, com a parte gráfica adaptada do emulador shadPS4."),
                      nullptr, nullptr, 0, nullptr, "iss_pc",
                      {{TL("Author", "Autor"), "HayatoG", 0}, {TL("Repository", "Repositório"), "github.com/HayatoG/iss_pc", 2},
                       {TL("Graphics base", "Base gráfica"), "shadPS4", 0}}});
         v.push_back({Kind::Section, TL("Credits", "Créditos")});
-        v.push_back({Kind::Fixed, TL("Steam Deck edition", "Edição Steam Deck"),
+        v.push_back({Kind::Fixed, "Deckport",
                      TL("Steam Deck adaptation, performance, controls and this menu.",
                         "Adaptação pro Steam Deck, desempenho, controles e este menu."),
                      nullptr, nullptr, 0, nullptr, "Kewin Lima",
@@ -1557,7 +1557,7 @@ void Draw() {
         }
         dl->PopClipRect();
         // selo
-        const char* selo = TL("STEAM DECK  ·  1280x800  ·  GAME FROZEN", "STEAM DECK  ·  1280x800  ·  JOGO CONGELADO");
+        const char* selo = TL("DECKPORT  ·  1280x800  ·  GAME FROZEN", "DECKPORT  ·  1280x800  ·  JOGO CONGELADO");
         const ImVec2 ss = Measure(reg, 1.2f * u, selo);
         Text(dl, reg, 1.2f * u, ImVec2(W - 8.0f * u - ss.x, 46.0f * u), Alpha(Apagado, fade), selo);
     }
