@@ -1169,7 +1169,8 @@ std::vector<Item> Build(int which) {
                      TL("When the frame rate drops below the target, the game lowers its own detail level (shorter LOD, fewer shadow cascades, fewer objects) and gives it back when there is room. Menus and loading are ignored.",
                         "Quando a taxa de quadros cai abaixo do alvo, o jogo baixa o próprio nível de detalhe (LOD mais curto, menos cascatas de sombra, menos objetos) e devolve quando sobra folga. Menus e carregamentos não contam."),
                      &quality_fps_index, pt ? auto_pt : auto_en, kQualityFpsCount, nullptr, "",
-                     {{TL("Applies", "Vale"), TL("right away", "na hora"), 0}}, 20});
+                     {{TL("Applies", "Vale"), TL("right away", "na hora"), 0},
+                      {TL("On the Deck", "No Deck"), TL("acts only below the target, up to level 4", "só age abaixo do alvo, até o nível 4"), 0}}, 20});
         static const char* const fsr_pt[] = {"Desligado", "Qualidade", "Equilibrado", "Desempenho"};
         static const char* const fsr_en[] = {"Off", "Quality", "Balanced", "Performance"};
         upscaler_index = UpscalerIndex();
@@ -1177,7 +1178,9 @@ std::vector<Item> Build(int which) {
                      TL("The scene is drawn smaller and FSR 3.1 rebuilds it at 1280x800 from several frames, in place of the game's anti-aliasing. Quality draws at 67%, Balanced at 59%, Performance at 50%. With it on, the Resolution above is not used.",
                         "A cena é desenhada menor e o FSR 3.1 reconstrói em 1280x800 a partir de vários quadros, no lugar do anti-serrilhado do jogo. Qualidade desenha a 67%, Equilibrado a 59%, Desempenho a 50%. Ligado, a Resolução acima não é usada."),
                      &upscaler_index, pt ? fsr_pt : fsr_en, 4, nullptr, "",
-                     {{TL("Applies", "Vale"), TL("when the game opens again", "na próxima abertura"), 0}}, 21});
+                     {{TL("Applies", "Vale"), TL("when the game opens again", "na próxima abertura"), 0},
+                      {TL("Quality", "Qualidade"), TL("+2 FPS on the Deck (neon special)", "+2 FPS no Deck (especial de neon)"), 1},
+                      {TL("Performance", "Desempenho"), TL("+5 FPS (+12%), softer picture", "+5 FPS (+12%), imagem mais suave"), 1}}, 21});
         v.push_back({Kind::Choice, TL("Field of view", "Campo de visão"),
                      TL("Smaller shows less around Delsin and makes everything bigger on the Deck's small screen.",
                         "Menor mostra menos em volta do Delsin e deixa tudo maior na tela pequena do Deck."),
