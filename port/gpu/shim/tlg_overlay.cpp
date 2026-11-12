@@ -1022,31 +1022,50 @@ double closing_at = -1.0; // fechando: menu some, pausa, escurecimento some, dep
 double dialog_at = 0.0;
 std::atomic<bool> close_request{false}; // View com o menu aberto (thread da janela)
 struct Snapshot {
-    int preset, resolution, distance, shadows, particles, fov, subtitles;
+    int preset, resolution, distance, shadows, particles, fov, subtitles, quality_fps, upscaler;
     bool motion_blur, ssr, unlock, fps, movie, easter;
 };
+// Qualidade automática (quality_target_fps, tlg_quality.h): a opção do menu é um índice nesta tabela.
+constexpr int kQualityFps[] = {0, 30, 40, 45, 60};
+constexpr int kQualityFpsCount = 5;
+std::atomic<int> quality_fps_index{0};
+// Upscaler FSR 3.1 (iss_temporal + iss_temporal_mode, lidos na abertura): 0 desligado, 1..3 = modos 1..3
+// (Qualidade 67%, Equilibrado 59%, Desempenho 50% da saída 1280x800).
+std::atomic<int> upscaler_index{0};
+int UpscalerIndex() {
+    const auto& s = TlgSettings::Get();
+    return s.iss_temporal ? std::clamp(s.iss_temporal_mode.load(), 1, 3) : 0;
+}
+int QualityFpsIndex(int fps) {
+    for (int i = 0; i < kQualityFpsCount; ++i)
+        if (kQualityFps[i] == fps) return i;
+    return fps <= 0 ? 0 : 1;
+}
 Snapshot snap{};
 Snapshot Take() {
     const auto& s = TlgSettings::Get();
     return {s.gfx_preset, s.gfx_resolution, s.gfx_distance, s.gfx_shadows, s.particles, s.gfx_fov,
-            s.gfx_subtitles, s.gfx_motion_blur, s.gfx_ssr, s.gfx_unlock_fps, s.show_fps, s.movie_skip,
-            s.easter_eggs};
+            s.gfx_subtitles, s.quality_target_fps, UpscalerIndex(), s.gfx_motion_blur, s.gfx_ssr, s.gfx_unlock_fps, s.show_fps,
+            s.movie_skip, s.easter_eggs};
 }
 void Restore(const Snapshot& v) {
     auto& s = TlgSettings::Get();
     s.gfx_preset = v.preset; s.gfx_resolution = v.resolution; s.gfx_distance = v.distance;
     s.gfx_shadows = v.shadows; s.particles = v.particles; s.gfx_fov = v.fov; s.gfx_subtitles = v.subtitles;
     s.gfx_motion_blur = v.motion_blur; s.gfx_ssr = v.ssr; s.gfx_unlock_fps = v.unlock; s.show_fps = v.fps;
-    s.movie_skip = v.movie; s.easter_eggs = v.easter;
+    s.movie_skip = v.movie; s.easter_eggs = v.easter; s.quality_target_fps = v.quality_fps;
+    s.iss_temporal = v.upscaler > 0;
+    if (v.upscaler > 0) s.iss_temporal_mode = v.upscaler;
 }
 // Mudou alguma coisa? (restart: só as que valem na próxima abertura; Mostrar FPS e os Extras valem na hora)
 bool Changed(bool restart_only) {
     const Snapshot n = Take();
     const bool gfx = n.preset != snap.preset || n.resolution != snap.resolution || n.distance != snap.distance ||
                      n.shadows != snap.shadows || n.particles != snap.particles || n.fov != snap.fov ||
-                     n.subtitles != snap.subtitles ||
+                     n.subtitles != snap.subtitles || n.upscaler != snap.upscaler ||
                      n.motion_blur != snap.motion_blur || n.ssr != snap.ssr || n.unlock != snap.unlock;
-    return gfx || (!restart_only && (n.fps != snap.fps || n.movie != snap.movie || n.easter != snap.easter));
+    return gfx || (!restart_only && (n.fps != snap.fps || n.movie != snap.movie || n.easter != snap.easter ||
+                                     n.quality_fps != snap.quality_fps));
 }
 bool CanRestart() {
     const char* c = std::getenv("TLG_RESTART_COMMAND");
@@ -1143,6 +1162,22 @@ std::vector<Item> Build(int which) {
                         "Menos efeitos que sobram e menos partículas por efeito: poderes e o especial ficam bem mais leves."),
                      &s.particles, levels, 3, nullptr, "",
                      {{TL("Neon special", "Especial de neon"), TL("much lighter", "bem mais leve"), 1}}, 2});
+        static const char* const auto_pt[] = {"Desligada", "30 FPS", "40 FPS", "45 FPS", "60 FPS"};
+        static const char* const auto_en[] = {"Off", "30 FPS", "40 FPS", "45 FPS", "60 FPS"};
+        quality_fps_index = QualityFpsIndex(s.quality_target_fps);
+        v.push_back({Kind::Choice, TL("Automatic quality", "Qualidade automática"),
+                     TL("When the frame rate drops below the target, the game lowers its own detail level (shorter LOD, fewer shadow cascades, fewer objects) and gives it back when there is room. Menus and loading are ignored.",
+                        "Quando a taxa de quadros cai abaixo do alvo, o jogo baixa o próprio nível de detalhe (LOD mais curto, menos cascatas de sombra, menos objetos) e devolve quando sobra folga. Menus e carregamentos não contam."),
+                     &quality_fps_index, pt ? auto_pt : auto_en, kQualityFpsCount, nullptr, "",
+                     {{TL("Applies", "Vale"), TL("right away", "na hora"), 0}}, 20});
+        static const char* const fsr_pt[] = {"Desligado", "Qualidade", "Equilibrado", "Desempenho"};
+        static const char* const fsr_en[] = {"Off", "Quality", "Balanced", "Performance"};
+        upscaler_index = UpscalerIndex();
+        v.push_back({Kind::Choice, TL("FSR 3.1 upscaling", "Upscaling FSR 3.1"),
+                     TL("The scene is drawn smaller and FSR 3.1 rebuilds it at 1280x800 from several frames, in place of the game's anti-aliasing. Quality draws at 67%, Balanced at 59%, Performance at 50%. With it on, the Resolution above is not used.",
+                        "A cena é desenhada menor e o FSR 3.1 reconstrói em 1280x800 a partir de vários quadros, no lugar do anti-serrilhado do jogo. Qualidade desenha a 67%, Equilibrado a 59%, Desempenho a 50%. Ligado, a Resolução acima não é usada."),
+                     &upscaler_index, pt ? fsr_pt : fsr_en, 4, nullptr, "",
+                     {{TL("Applies", "Vale"), TL("when the game opens again", "na próxima abertura"), 0}}, 21});
         v.push_back({Kind::Choice, TL("Field of view", "Campo de visão"),
                      TL("Smaller shows less around Delsin and makes everything bigger on the Deck's small screen.",
                         "Menor mostra menos em volta do Delsin e deixa tudo maior na tela pequena do Deck."),
@@ -1390,6 +1425,12 @@ void Change(Item& it, int index, int step) {
     } else if (it.id == 2 && s.gfx_preset < 3) {
         s.gfx_preset = 3; // um item só mudou: personalizado
         value_changed[tab][1] = now;
+    } else if (it.id == 21) {
+        const int u = std::clamp(upscaler_index.load(), 0, 3);
+        s.iss_temporal = u > 0;
+        if (u > 0) s.iss_temporal_mode = u;
+    } else if (it.id == 20) {
+        s.quality_target_fps = kQualityFps[std::clamp(quality_fps_index.load(), 0, kQualityFpsCount - 1)];
     }
 }
 
@@ -2265,7 +2306,7 @@ void NativeRenderingTab() {
     const bool live_native=runtime_native_live_enabled()!=0;
     ImGui::TextWrapped("%s",live_native?"Experimental live native rendering. Select a resolution or release the internal resolution slider to queue a safe rebuild. Larger allocations still require restarting this candidate.":"Experimental native 3D rendering for CUSA00223 update 1.07. Changes apply after closing and relaunching the game.");
     const char* outputs[]={TL("Off (original game)","Desligado (jogo original)"),"1080p  1920 x 1080","1440p  2560 x 1440",
-        "3440 x 1440 (21:9)","4K  3840 x 2160","5120 x 1440 (32:9)"};
+        "3440 x 1440 (21:9)","4K  3840 x 2160","5120 x 1440 (32:9)","Steam Deck  1280 x 800 (16:10)"};
     int output=s.iss_native_output, percent=s.iss_native_percent;
     bool edges=s.iss_native_hud_edges;
     // Output first; the internal resolution is a scene height (iss_native_pick in

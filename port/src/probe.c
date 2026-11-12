@@ -785,8 +785,9 @@ static void install_iss_temporal(const char *app0, Segment *segments, uint64_t c
     snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
     sfo_value(path, "TITLE_ID", serial, sizeof(serial), NULL);
     sfo_value(path, "APP_VER", version, sizeof(version), NULL);
-    if (strcmp(serial, "CUSA00223") || strcmp(version, "01.07")) {
-        printf("Temporal upscaling: unavailable (title '%s', version '%s'; needs CUSA00223 01.07)\n", serial, version);
+    /* steam-deck: CUSA00004 01.07 too (the same executable; the hooks below still check every byte) */
+    if ((strcmp(serial, "CUSA00223") && strcmp(serial, "CUSA00004")) || strcmp(version, "01.07")) {
+        printf("Temporal upscaling: unavailable (title '%s', version '%s'; needs CUSA00223 or CUSA00004 01.07)\n", serial, version);
         return;
     }
     if (!mapped(segments, count, ISS_TEMPORAL_JITTER_SITE, ISS_TEMPORAL_JITTER_LENGTH) ||

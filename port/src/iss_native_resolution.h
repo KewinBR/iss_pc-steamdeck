@@ -14,9 +14,15 @@
 #include <errno.h>
 #include "iss_native_exposure.h"
 
-enum { ISS_NATIVE_PRESETS = 6, ISS_NATIVE_SITE_COUNT = 18 };
-static const uint32_t iss_native_widths[] = {0,1920,2560,3440,3840,5120};
-static const uint32_t iss_native_heights[] = {0,1080,1440,1440,2160,1440};
+/* steam-deck: preset 6 = the Steam Deck screen, 1280 x 800 (16:10). */
+enum { ISS_NATIVE_PRESETS = 7, ISS_NATIVE_SITE_COUNT = 18 };
+static const uint32_t iss_native_widths[] = {0,1920,2560,3440,3840,5120,1280};
+static const uint32_t iss_native_heights[] = {0,1080,1440,1440,2160,1440,800};
+/* steam-deck: the European game (CUSA00004) ships the same 01.07 executable as the US one; every write
+ * below is still guarded byte by byte, so a different executable is refused as before. */
+static inline int iss_native_title_ok(const char *serial,const char *version) {
+    return (!strcmp(serial,"CUSA00223") || !strcmp(serial,"CUSA00004")) && !strcmp(version,"01.07");
+}
 typedef struct IssNativeConfig { int output, percent, hud_edges;
 #ifdef __cplusplus
     int ui_16_9=0;
@@ -63,7 +69,7 @@ static inline int iss_native_config(FILE *f, IssNativeConfig *c) {
         if (!strncmp(line,"iss_native_output=",18)) valid &= iss_native_integer(line+18,0,ISS_NATIVE_PRESETS-1,&c->output);
         if (!strncmp(line,"iss_native_percent=",19)) valid &= iss_native_integer(line+19,25,200,&c->percent);
         if (!strncmp(line,"iss_native_hud_edges=",21)) valid &= iss_native_integer(line+21,0,1,&c->hud_edges);
-        if (!strncmp(line,"iss_native_ui_16_9=",19)) valid &= iss_native_integer(line+19,0,2,&c->ui_16_9);
+        if (!strncmp(line,"iss_native_ui_16_9=",19)) valid &= iss_native_integer(line+19,0,3,&c->ui_16_9);
         if (!strncmp(line,"iss_temporal_mode=",18)) valid &= iss_native_integer(line+18,0,ISS_TEMPORAL_MODES-1,&c->temporal_mode);
     }
     return valid;
@@ -82,7 +88,7 @@ static inline uint32_t iss_native_scale(uint32_t dimension,int percent) {
 static inline int iss_native_plan(IssNativeConfig c, IssNativePlan *p) {
     memset(p,0,sizeof(*p));
     if(c.output<=0 || c.output>=ISS_NATIVE_PRESETS || c.percent<25 || c.percent>200 ||
-       (c.hud_edges!=0 && c.hud_edges!=1)||c.ui_16_9<0||c.ui_16_9>2)return 0;
+       (c.hud_edges!=0 && c.hud_edges!=1)||c.ui_16_9<0||c.ui_16_9>3)return 0;
     p->output_width=iss_native_widths[c.output]; p->output_height=iss_native_heights[c.output];
     /* At 100% these are EXACT output pixels, never an upscale-only 16:9 image.
      * Other percentages round to even pixels; Vulkan tiling alignment is handled
@@ -95,6 +101,9 @@ static inline int iss_native_plan(IssNativeConfig c, IssNativePlan *p) {
     p->ui_height=1080;
     p->ui_width=(p->output_width*1080u+p->output_height/2)/p->output_height;
     if(c.ui_16_9)p->ui_width=1920;
+    /* steam-deck: ui_16_9=3 keeps the canvas 1920 wide and takes the height from the output's shape
+     * (1920 x 1200 on the Deck's 16:10): the HUD and its safe margins as the 16:10 patch had them. */
+    if(c.ui_16_9==3)p->ui_height=(1920u*p->output_height+p->output_width/2)/p->output_width;
     // Diagnostic: retain a 16:9 menu aspect while giving fixed-size HUD
     // artwork the wide display's logical width. Integer 16:9 units keep
     // the canvas proportional; never alter scene/output dimensions here.
@@ -187,7 +196,7 @@ static inline void iss_native_changes(const IssNativePlan *p,IssNativeSite sites
 static inline int iss_native_apply(unsigned char *image,uint64_t size,const char *serial,
                                    const char *version,IssNativeConfig config) {
     IssNativePlan plan;
-    if(!image || strcmp(serial,"CUSA00223") || strcmp(version,"01.07") || !iss_native_plan(config,&plan))return 0;
+    if(!image || !iss_native_title_ok(serial,version) || !iss_native_plan(config,&plan))return 0;
     const uint32_t exposure_entries=iss_native_exposure_entries(plan.width,plan.height);
     if(!exposure_entries || (exposure_entries>ISS_EXPOSURE_ORIGINAL_ENTRIES&&!iss_native_exposure_guard(image,size)))return 0;
     if(size<0x58030cu+sizeof(iss_native_projection) ||

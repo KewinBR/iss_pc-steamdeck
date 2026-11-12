@@ -163,7 +163,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "frames_queued") {
         v.frames_queued = TlgGraphics::ParseFramesQueued(value.empty() ? -1 : i);
     } else if (key == "iss_native_output") {
-        v.iss_native_output = std::clamp(i,0,5);
+        v.iss_native_output = std::clamp(i,0,6); // steam-deck: 6 = Steam Deck 1280x800
     } else if (key == "iss_native_percent") {
         v.iss_native_percent = std::clamp(i,25,200);
     } else if (key == "iss_native_hud_edges") {
@@ -184,7 +184,7 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         int index=key=="iss_power_key_smoke"?0:key=="iss_power_key_neon"?1:key=="iss_power_key_video"?2:3;
         v.iss_power_keys[index]=std::clamp(i,0,511);
     } else if (key == "iss_native_ui_16_9") {
-        v.iss_native_ui_16_9 = std::clamp(i,0,2);
+        v.iss_native_ui_16_9 = std::clamp(i,0,3); // steam-deck: 3 = 1920 wide, height from the output (16:10)
     } else if (key == "render_resolution") {
         v.render_resolution = TlgGraphics::ParseResolution(value);
     } else if (key == "engine_fps") {
