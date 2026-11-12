@@ -1,17 +1,17 @@
-<p align="center"><img src="https://raw.githubusercontent.com/KewinBR/infamous-second-son-steamdeck/main/arte/logo-vertical.png" width="360" alt="inFAMOUS Second Son - Steamdeck Version"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/KewinBR/deckport-infamous-ss/main/arte/logo-vertical.png" width="360" alt="inFAMOUS Second Son, Deckport (STEAMDECK VERSION)"></p>
 
-# inFAMOUS Second Son: Steamdeck Version (source code)
+# Deckport: inFAMOUS Second Son (source code)
 
-**To install and play, go to [infamous-second-son-steamdeck](https://github.com/KewinBR/infamous-second-son-steamdeck)**
+**To install and play, go to [deckport-infamous-ss](https://github.com/KewinBR/deckport-infamous-ss)**
 (installer, tutorial in English and Portuguese, credits).
 
-This repository is the source code of the port that runs there: a copy of HayatoG's
+This repository is the source code of Deckport, the port that runs there: a copy of HayatoG's
 [iss_pc](https://github.com/HayatoG/iss_pc) (native PC port of inFAMOUS Second Son, with renderer v2) with the
 changes made for the Steam Deck, in the `steam-deck` branch. GPL-2.0, like iss_pc. The original project's README is
 in [README-iss_pc.md](README-iss_pc.md).
 
-**Para instalar e jogar, vá em [infamous-second-son-steamdeck](https://github.com/KewinBR/infamous-second-son-steamdeck)**
-(instalador, tutorial em português e inglês, créditos). Este repositório é o código do port: uma cópia do
+**Para instalar e jogar, vá em [deckport-infamous-ss](https://github.com/KewinBR/deckport-infamous-ss)**
+(instalador, tutorial em português e inglês, créditos). Este repositório é o código do Deckport: uma cópia do
 [iss_pc](https://github.com/HayatoG/iss_pc) de HayatoG com as mudanças feitas para o Steam Deck, no ramo `steam-deck`.
 
 ## Changes for the Steam Deck / Mudanças para o Steam Deck
@@ -22,4 +22,4 @@ in [README-iss_pc.md](README-iss_pc.md).
 - The port menu keeps the launcher's `tlg.ini` keys (renderer, native passes) when it saves.
 - Diagnostics used during the work (hunt notebook, label watch, TSC scan), all off unless their variable is set.
 
-Steam Deck port: Kewin Lima. Base: iss_pc by HayatoG and the projects it builds on (see README-iss_pc.md).
+Deckport (Steam Deck port): Kewin Lima. Base: iss_pc by HayatoG and the projects it builds on (see README-iss_pc.md).

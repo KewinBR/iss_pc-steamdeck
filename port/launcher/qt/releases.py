@@ -5,6 +5,7 @@ when the player asks for it."""
 import json
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -15,11 +16,36 @@ TIMEOUT = 10
 
 
 class UpdateError(Exception):
-    """kind: offline | timeout | limit | http | bad | none (the key suffix of the friendly message)."""
+    """kind: offline | timeout | limit | http | bad | none (the key suffix of the friendly message).
+    reset: for 'limit', when GitHub takes requests again (Unix time), None when it did not say."""
 
-    def __init__(self, kind, detail=''):
+    def __init__(self, kind, detail='', reset=None):
         super().__init__(f'{kind}: {detail}')
-        self.kind, self.detail = kind, detail
+        self.kind, self.detail, self.reset = kind, detail, reset
+
+
+def limit_reset(code, headers, now=None):
+    """For a 403/429 answer of the API: None when it is not a rate limit, else when requests are
+    taken again (Unix time; 0 when GitHub did not say). GitHub's limit for requests without login
+    is 60 an hour per IP address, shared by every program of the network: X-RateLimit-Remaining 0
+    and X-RateLimit-Reset, or Retry-After (seconds) for its secondary limit."""
+    headers = headers or {}
+    now = time.time() if now is None else now
+    retry = str(headers.get('Retry-After') or '').strip()
+    if retry.isdigit():
+        return int(now) + int(retry)
+    if str(headers.get('X-RateLimit-Remaining') or '').strip() == '0':
+        reset = str(headers.get('X-RateLimit-Reset') or '').strip()
+        return int(reset) if reset.isdigit() else 0
+    return 0 if code == 429 else None
+
+
+def error_text(error, t):
+    """The Updates screen's message for an UpdateError; t(key, **fmt) is the launcher's translation.
+    A rate limit with a known reset says when to try again (local time)."""
+    if error.kind == 'limit' and error.reset:
+        return t('upd_err_limit_until', time=time.strftime('%H:%M', time.localtime(error.reset)))
+    return t('upd_err_' + error.kind, detail=error.detail)
 
 
 # ------------------------------------------------------------------------------------ versions
@@ -123,21 +149,30 @@ def user_agent(version=''):
     return f'iss_pc-launcher/{version or "unknown"} (+https://github.com/HayatoG/iss_pc)'
 
 
-def fetch_latest(version='', opener=urllib.request.urlopen, url=API_URL, timeout=TIMEOUT):
+def fetch_latest(version='', opener=urllib.request.urlopen, url=API_URL, timeout=TIMEOUT, etag=''):
     """The one request the launcher makes: GET the latest release. Sends no data of the player,
-    only the User-Agent that names the port. Returns {'tag','name','url','body','published','assets'}
-    (assets: [{'name','url','size'}] of the files whose download URL is HTTPS on our own releases).
+    only the User-Agent that names the port. Returns {'tag','name','url','body','published','assets',
+    'etag'} (assets: [{'name','url','size'}] of the files whose download URL is HTTPS on our own
+    releases). With the etag of the release seen before it asks only whether that changed: None
+    when it did not (a 304, which GitHub does not count against its limit).
     Raises UpdateError with a kind the screen turns into a friendly message."""
-    request = urllib.request.Request(url, headers={'User-Agent': user_agent(version),
-                                                   'Accept': 'application/vnd.github+json'})
+    headers = {'User-Agent': user_agent(version), 'Accept': 'application/vnd.github+json'}
+    if etag:
+        headers['If-None-Match'] = etag
+    request = urllib.request.Request(url, headers=headers)
     try:
         with opener(request, timeout=timeout) as response:
             raw = response.read(2 * 1024 * 1024)
+            answer_etag = str((getattr(response, 'headers', None) or {}).get('ETag') or '')
     except urllib.error.HTTPError as error:
+        if error.code == 304 and etag:
+            return None
         if error.code == 404:
             raise UpdateError('none') from error
         if error.code in (403, 429):
-            raise UpdateError('limit', str(error.code)) from error
+            reset = limit_reset(error.code, error.headers)
+            if reset is not None:
+                raise UpdateError('limit', str(error.code), reset=reset or None) from error
         raise UpdateError('http', str(error.code)) from error
     except (socket.timeout, TimeoutError) as error:
         raise UpdateError('timeout') from error
@@ -163,4 +198,4 @@ def fetch_latest(version='', opener=urllib.request.urlopen, url=API_URL, timeout
                            'digest': str(asset.get('digest') or '')})
     return {'tag': tag, 'name': str(data.get('name') or tag), 'body': str(data.get('body') or ''),
             'url': page if page.startswith(RELEASE_PREFIX) else RELEASES_URL,    # only our own releases page opens
-            'published': str(data.get('published_at') or '')[:10], 'assets': assets}
+            'published': str(data.get('published_at') or '')[:10], 'assets': assets, 'etag': answer_etag}

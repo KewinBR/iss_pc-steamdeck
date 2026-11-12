@@ -54,8 +54,15 @@ of the job file in 14 s and 7952 compute shaders in 85 s; in game then 14 graphi
 compute shader are compiled (1097 and 21 without the job file).
 
 Windows: built with MSYS2 CLANG64 as a static library linked into `out/tlg-probe-v2.exe`
-(`compat/mingw.h` for the MSVC intrinsics MinGW lacks); both CI packages ship it. Not tested on a
-Windows machine yet.
+(`compat/mingw.h` for the MSVC intrinsics MinGW lacks); both CI packages ship it. On Windows the
+launcher starts the game with renderer v2 by default, native passes on and unified memory off
+(launcher switches "Renderer", "Native passes", "Unified memory"). Measured on two PCs with an RTX 3060
+(Ryzen 5 5500 and 4600G, package v2026.10.21-744a854): 11-20 FPS in gameplay with unified memory on,
+~40-45 FPS with it off and native passes on, about what Castlesea's release does on the same PC. With
+unified memory on, the game's fences wait for the GPU about 28 times a frame. Castlesea's release has
+it on too, but there its heap range (0x20000000) never matches the heap, which sits at 0x80000000.
+`ISS_NATIVE_PASSES_BLEND_DENY` in `defaults.env` is Castlesea's pause-menu target moved to this
+runtime's heap C (0x1068000000 instead of 0x200000000, same offset).
 
 Not yet: mouse capture, the renderer's ImGui still composes the game image, native passes on NVIDIA.
 

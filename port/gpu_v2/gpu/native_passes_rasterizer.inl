@@ -30,6 +30,19 @@ struct Globals {
 };
 static Globals g;
 
+// Ranges the pool threads did not find resident in the arena: the command processor makes them
+// resident before its next segment (PrefaultArena), so the next frame's jobs find them.
+struct ArenaMisses {
+    std::mutex mutex;
+    std::vector<std::pair<VAddr, u32>> ranges;
+    std::unordered_set<VAddr> queued; ///< 64 KB granules already queued
+    std::atomic<bool> pending{};
+};
+static ArenaMisses& Misses() {
+    static ArenaMisses m;
+    return m;
+}
+
 // Keys the command processor gave up learning.
 struct Unlearnable {
     std::shared_mutex mutex;
@@ -611,7 +624,13 @@ struct Worker {
                 .allocationSize = requirements.size,
                 .memoryTypeIndex = type,
             });
-            if (result == vk::Result::eSuccess) memory = allocated;
+            if (result == vk::Result::eSuccess) {
+                memory = allocated;
+                static std::atomic<u32> rings{};
+                std::fprintf(stderr, "VRAM_RING native_passes worker=%u %llu MB vram=%d\n",
+                             rings.fetch_add(1) + 1, (unsigned long long)(requirements.size >> 20),
+                             int(type == types[0]));
+            }
         }
         if (!memory) return false;
         Check(device.bindBufferMemory(ring, memory, 0));
@@ -1205,7 +1224,17 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         // Read first: an arena created or migrated after it changes the generation.
         const u64 arena_gen = cache.ArenaBindingGeneration();
         const auto arena = cache.PeekPublishedArena(address, u32(size));
-        if (!arena) return false;
+        if (!arena) {
+            if (size <= (16u << 20)) {
+                auto& m = Misses();
+                std::scoped_lock lock{m.mutex};
+                if (m.ranges.size() < 8192 && m.queued.insert(address >> 16).second) {
+                    m.ranges.emplace_back(address, u32(size));
+                    m.pending.store(true, std::memory_order_release);
+                }
+            }
+            return false;
+        }
         handle = arena.arena->Handle();
         offset = arena.offset;
         for (const auto& a : r.arena_reads)
@@ -1323,10 +1352,12 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         }
         vk::Buffer handle;
         u64 offset;
-        if (!resolve(sharp.base_address, sharp.GetSize(), handle, offset)) return fail(MissBuffer);
+        const u64 size =
+            VideoCore::ClampHugeRead(sharp.GetSize(), stage.buffers[slot.desc].is_written);
+        if (!resolve(sharp.base_address, size, handle, offset)) return fail(MissBuffer);
         const u64 aligned = Common::AlignDown(offset, alignment);
         push.buf_offsets[slot.binding] = u8(offset - aligned);
-        info = vk::DescriptorBufferInfo{handle, aligned, sharp.GetSize() + (offset - aligned)};
+        info = vk::DescriptorBufferInfo{handle, aligned, size + (offset - aligned)};
     }
     NativeMaterial::BuildWrites(*t, infos.data(), writes);
     {
@@ -1566,7 +1597,7 @@ static bool IsUnlearnable(u64 key) {
 }
 
 struct CpStats {
-    u64 executed{}, draws{}, report{}, learned{}, learn_mismatch{}, learn_failed{}, relearn{},
+    u64 executed{}, draws{}, report{}, prefault_batches{}, learned{}, learn_mismatch{}, learn_failed{}, relearn{},
         inherited_merged{};
     std::array<u64, 13> reject{};
     // ISS_NATIVE_INDIRECT: segments starting at an indexed indirect draw.
@@ -1584,6 +1615,10 @@ constexpr const char* reject_names[13] = {"context", "user_data", "inherited", "
                                           "env", "inherited_state", "dynamic", "assumed"};
 
 static void Report() {
+    static const bool reports=[] {
+        const char* p=std::getenv("ISS_NATIVE_PASSES_REPORT");return p&&std::strcmp(p,"1")==0;
+    }();
+    if(!reports)return; // Optional diagnostic-only comparison; draw decisions are unchanged.
     std::fprintf(stderr,
                  "NATIVE_PASSES_GUARDS template_gate=%d learn_gated=%llu auto_draws=%llu depth_mix=%llu "
                  "(guard %s) classes=%u left[opaque=%llu depth=%llu blend=%llu]\n",
@@ -1757,6 +1792,22 @@ bool Rasterizer::NativePassExecute(iss::native_passes::Segment& s,
         occlusion.HasOpen() || buffer_cache.HasComputeQueue() ||
         !instance.IsVertexInputDynamicState() || iss::hazard_probe::Enabled())
         return reject(RejectEnv);
+    if (auto& m = Misses(); m.pending.load(std::memory_order_acquire)) {
+        std::vector<std::pair<VAddr, u32>> ranges;
+        {
+            std::scoped_lock lock{m.mutex};
+            ranges.swap(m.ranges);
+            m.queued.clear();
+            m.pending.store(false, std::memory_order_relaxed);
+        }
+        static std::atomic<u64> prefaulted{}, refused{};
+        for (const auto& [address, size] : ranges)
+            (buffer_cache.PrefaultArena(address, size) ? prefaulted : refused)
+                .fetch_add(1, std::memory_order_relaxed);
+        if ((++c.prefault_batches & 255) == 1)
+            std::fprintf(stderr, "NATIVE_ARENA_PREFAULT ranges=%llu refused=%llu\n",
+                         (unsigned long long)prefaulted.load(), (unsigned long long)refused.load());
+    }
     auto* r = static_cast<Rec*>(s.recording);
     if (!r || r->templates.empty()) return reject(RejectPipeline);
     iss::cp_path::Switch(iss::cp_path::RecChain);
@@ -2020,6 +2071,12 @@ bool Rasterizer::NativePassExecute(iss::native_passes::Segment& s,
             ResetBindings(false);
             return reject(RejectTargets);
         }
+    }
+    if (iss_temporal && iss_temporal->UiActive()) {
+        // Drawing below the output size: the command processor redirects each draw (a replay would draw
+        // into the guest's images, at the render size).
+        ResetBindings(false);
+        return reject(RejectTargets);
     }
     const RenderState render = BeginRendering(pipeline);
     if (attachment_feedback_loop) {

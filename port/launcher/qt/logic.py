@@ -44,8 +44,10 @@ def tk_text():
         import infamous_launcher
         return dict(infamous_launcher.TEXT)
     except Exception:  # tkinter missing in a slim Python
+        import dlss_setup
+        import native_resolution
         import preset_share
-        return {**preset_share.TEXT, **tlg_run.TEXT}
+        return {**preset_share.TEXT, **native_resolution.TEXT, **dlss_setup.TEXT, **tlg_run.TEXT}
 
 
 def system_is_portuguese():
@@ -99,7 +101,7 @@ GROUP_ORDER = ('light', 'perf', 'tex', 'exp')
 _GROUP_OF = {
     'BP03': 'light', 'BP04': 'light', 'BP05': 'light', 'BP11': 'light', 'BP12': 'light',
     'TLG_WQM': 'light', 'TLG_LDS_SMALL': 'light', 'TLG_LDS_MULTI': 'light',
-    'TLG_LDS_READLANE': 'light', 'TLG_LANE_DIVERGENCE': 'light', 'TLG_OCCLUSION_MODE': 'light', 'TLG_RENDERER': 'light', 'TLG_NATIVE_PASSES': 'light',
+    'TLG_LDS_READLANE': 'light', 'TLG_LANE_DIVERGENCE': 'light', 'TLG_OCCLUSION_MODE': 'light', 'TLG_RENDERER': 'light', 'TLG_NATIVE_PASSES': 'light', 'ISS_UNIFIED_MEMORY': 'light',
     'TLG_DYNAMIC_STRIDE': 'light',
     'BP01': 'perf', 'BP02': 'perf', 'BP07': 'perf', 'BP08': 'perf',
     'TLG_ASYNC_SHADERS': 'perf', 'TLG_DEFERRED_READBACK': 'perf', 'TLG_STALE_READBACK': 'perf',

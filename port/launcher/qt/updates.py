@@ -103,6 +103,9 @@ class Updates(QObject):
         if self._phase == 'ready':
             return self.t('upd_installed', folder=str(self._new_dir))
         if self._error:
+            if self.release:    # the release on screen is the one of an earlier check, not today's
+                seen = self.release.get('checked') or self.release.get('published') or '?'
+                return self._error + ' ' + self.t('upd_cached', checked=seen)
             return self._error
         status = self.status()
         tag = self.latest
@@ -154,9 +157,12 @@ class Updates(QObject):
         self._checking, self._error = True, ''
         self.changed.emit()
         version = self.installed()
+        # The release seen before: GitHub answers 304 when it is still the latest, without counting
+        # the request against its limit of 60 an hour per network.
+        etag = (self.release or {}).get('etag', '')
 
         def work():
-            fetch = self.probes.get('fetch') or (lambda v: releases.fetch_latest(v))
+            fetch = self.probes.get('fetch') or (lambda v: releases.fetch_latest(v, etag=etag))
             try:
                 self.fetched.emit(fetch(version))
             except releases.UpdateError as error:
@@ -167,12 +173,18 @@ class Updates(QObject):
 
     def _on_fetched(self, result):
         self._checking = False
+        today = datetime.date.today().isoformat()
         if isinstance(result, releases.UpdateError):
-            self._error = self.t('upd_err_' + result.kind, detail=result.detail)
+            self._error = releases.error_text(result, self.t)
+        elif result is None:    # 304: the release seen before is still the latest
+            if self.release:
+                self.release['checked'] = today
+                self.backend.settings['update_seen'] = self.release
+                self._save()
         else:
             self.release = {'tag': result['tag'], 'url': result['url'], 'body': result['body'][:20000],
                             'published': result['published'], 'assets': list(result.get('assets') or [])[:20],
-                            'checked': datetime.date.today().isoformat()}
+                            'checked': today, 'etag': result.get('etag', '')}
             self.backend.settings['update_seen'] = self.release
             self._save()
         self.changed.emit()

@@ -184,6 +184,12 @@ def screens_a_shots(app, backend, out):
         app.grab(out / f'graficos-{lang}.png')
         graphics.scrollRequested.emit(760)
         app.grab(out / f'graficos-{lang}-meio.png')
+        graphics.scrollRequested.emit(1500)
+        app.grab(out / f'graficos-{lang}-renderer.png')
+        graphics.setValue('TLG_RENDERER', '1')            # the switch on: renderer v2, native passes enabled
+        graphics.setValue('TLG_NATIVE_PASSES', '1')
+        app.grab(out / f'graficos-{lang}-renderer-v2.png')
+        graphics.applyPreset('balanced')
         graphics.scrollRequested.emit(99999)
         app.grab(out / f'graficos-{lang}-fim.png')
         graphics.scrollRequested.emit(0)

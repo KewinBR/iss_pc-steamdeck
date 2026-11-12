@@ -16,8 +16,11 @@ probe copies ISS_X to TLG_X, like the rest of the launcher); the menu keys are r
 by the game itself. A switch the player never touched changes nothing.
 All values are strings, as in the ini: '0'/'1' for on/off.
 """
+import os
 from collections import namedtuple
 from pathlib import Path
+
+_WINDOWS = os.name == 'nt'
 
 # group: 'menu' | 'bp' | 'ab'.  vtype: 'bool' | 'choice' | 'int' | 'float'.
 # default: '0'/'1' (bool) or the value text; None = automatic (the GPU backend decides per driver).
@@ -25,16 +28,18 @@ from pathlib import Path
 # pass_env: give ISS_<suffix> to the game; False when the game reads the ini key itself (the
 #   in-game menu writes it too, and an environment variable would override the menu).
 # choices: ((value, en, pt), ...) for 'choice'; lo/hi/unit for 'int'.
+# hidden: kept in the table (ini key, defaults, presets and tests still know it) but not shown by the
+#   launchers; the in-game menu may still have it. Used for options that wait for validation.
 Item = namedtuple('Item', 'id group key env vtype default choices lo hi unit shader live store '
-                          'pass_env risky broken name what source tab')
+                          'pass_env risky broken name what source tab hidden')
 Item.__new__.__defaults__ = ()
 
 
 def _make(id, group, key, env, vtype, default, name, what, *, choices=(), lo=0, hi=0, unit='',
           shader=False, live=False, store='ini', pass_env=False, risky=False, broken=False,
-          source='', tab=''):
+          source='', tab='', hidden=False):
     return Item(id, group, key, env, vtype, default, choices, lo, hi, unit, shader, live, store,
-                pass_env, risky, broken, name, what, source, tab)
+                pass_env, risky, broken, name, what, source, tab, hidden)
 
 
 def _bp(n, default, shader, live, name, what, source, risky=False):
@@ -61,6 +66,7 @@ def _menu(tab, key, vtype, default, name, what, **kw):
 # launcher's own Video box and not repeated here. Every menu option takes effect on the next frame.
 _CORNERS = (('0', 'Top left', 'Superior esquerdo'), ('1', 'Top right', 'Superior direito'),
             ('2', 'Bottom left', 'Inferior esquerdo'), ('3', 'Bottom right', 'Inferior direito'))
+_UPSCALERS = (('0', 'FSR 3.1', 'FSR 3.1'), ('1', 'NVIDIA DLSS', 'NVIDIA DLSS'))
 MENU = [
     _menu('Image', 'fsr1', 'bool', '0', ('Upscale with FSR 1', 'Ampliar com FSR 1'),
           ('Enlarges the game image when it is smaller than the window (spatial filter, no shimmer).',
@@ -70,6 +76,29 @@ MENU = [
            'Deixa a imagem final mais nítida. Precisa do FSR 1 quando a imagem do jogo é menor que a janela.')),
     _menu('Image', 'rcas_strength', 'int', '60', ('Sharpening strength', 'Intensidade da nitidez'),
           ('How strong the sharpening is.', 'Quão forte é a nitidez.'), lo=0, hi=100, unit='%'),
+    _make('menu:iss_temporal', 'menu', 'iss_temporal', '', 'bool', '0',
+          ('Temporal upscaler FSR 3.1 (experimental, next start)', 'Upscaler temporal FSR 3.1 (experimental, próxima partida)'),
+          ("Replaces the game's anti-aliasing with AMD FSR 3.1 temporal (renderer v2). Read at start. If it cannot be "
+           'created the game keeps its own anti-aliasing (see the log).',
+           'Troca o anti-aliasing do jogo pelo FSR 3.1 temporal da AMD (renderer v2). Lido na partida. Se não puder '
+           'ser criado, o jogo mantém o anti-aliasing dele (veja o log).'), live=False, tab='Image'),
+    _make('menu:iss_temporal_mode', 'menu', 'iss_temporal_mode', '', 'choice', '0',
+          ('Temporal upscaler: mode (next start)', 'Upscaler temporal: modo (próxima partida)'),
+          ('The game draws at the output size divided by this ratio and FSR 3.1 rebuilds the output image. Native keeps '
+           'the internal resolution chosen under Output. Needs an output resolution.',
+           'O jogo desenha no tamanho da saída dividido por essa razão e o FSR 3.1 reconstrói a imagem de saída. Nativo '
+           'mantém a resolução interna escolhida em Saída. Precisa de uma resolução de saída.'),
+          choices=(('0', 'Native (anti-aliasing, resolution below)', 'Nativo (anti-aliasing, resolução abaixo)'),
+                   ('1', 'Quality (1.5x)', 'Qualidade (1,5x)'), ('2', 'Balanced (1.7x)', 'Equilibrado (1,7x)'),
+                   ('3', 'Performance (2x)', 'Desempenho (2x)'), ('4', 'Ultra performance (3x)', 'Desempenho máximo (3x)')),
+          live=False, tab='Image'),
+    _make('menu:iss_temporal_backend', 'menu', 'iss_temporal_backend', '', 'choice', '0',
+          ('Temporal upscaler: which one (next start)', 'Upscaler temporal: qual usar (próxima partida)'),
+          ('FSR 3.1 works on any card. NVIDIA DLSS needs a GeForce RTX card plus nvngx_dlss.dll and the tlg_dlss.dll '
+           'bridge (Graphics screen shows what is missing); without them FSR 3.1 is used. Read at start.',
+           'O FSR 3.1 funciona em qualquer placa. O DLSS da NVIDIA precisa de uma GeForce RTX, do nvngx_dlss.dll e da '
+           'ponte tlg_dlss.dll (a tela Gráficos mostra o que falta); sem eles o FSR 3.1 é usado. Lido na partida.'),
+          choices=_UPSCALERS, live=False, tab='Image'),
     # Draw distance (gpu/shim/tlg_view.h): the in-game menu's sliders; the same ranges.
     _menu('View', 'lod_scale', 'float', '1', ('LOD distance', 'Distância do LOD'),
           ('How far objects keep their detailed models (every LOD band). Above 1x costs CPU and GPU; '
@@ -92,6 +121,36 @@ MENU = [
           ('Default far plane of the cameras (the game uses 10000000, unlimited). Lower cuts the view.',
            'Plano distante padrão das câmeras (o jogo usa 10000000, sem limite). Menor corta a visão.'),
           lo=1000.0, hi=10000000.0),
+    _menu('View', 'dyn_cull', 'choice', '0', ('Dynamic quality: dropped objects', 'Qualidade dinâmica: objetos descartados'),
+          ('In heavy scenes the game raises a quality level on its own and, at levels 15 to 20, skips a share of '
+           'objects and particles at random. Performance starts skipping earlier: smoother, less detail.',
+           'Em cenas pesadas o jogo sobe um nível de qualidade sozinho e, nos níveis 15 a 20, pula uma parte dos '
+           'objetos e partículas ao acaso. Desempenho começa a pular antes: mais fluido, menos detalhe.'),
+          choices=(('0', "The game's own", 'Do jogo'), ('1', 'Never drop objects', 'Nunca descartar objetos'),
+                   ('2', 'Performance (drop from level 11)', 'Desempenho (descarta a partir do nível 11)')),
+          hidden=True),
+    _menu('View', 'quality_target_fps', 'choice', '0',
+          ('Automatic quality: target frame rate', 'Qualidade automática: taxa de quadros alvo'),
+          ('Raises the minimum quality level while the frame rate stays under the target and gives it back when '
+           'there is room to spare (menus and loading are ignored). The minimum below still applies.',
+           'Sobe o nível mínimo de qualidade enquanto a taxa de quadros fica abaixo do alvo e devolve quando '
+           'há folga (menus e carregamentos são ignorados). O mínimo abaixo continua valendo.'),
+          choices=(('0', 'Off', 'Desligado'), ('30', '30 FPS', '30 FPS'), ('45', '45 FPS', '45 FPS'),
+                   ('60', '60 FPS', '60 FPS'))),
+    _menu('View', 'quality_floor', 'int', '1', ('Minimum dynamic quality level', 'Nível mínimo da qualidade dinâmica'),
+          ('The game steps its quality level (0 best, 14 lowest: shorter LOD, fewer shadow cascades, fewer objects) '
+           'up in heavy scenes and back down in light ones. Raising the minimum keeps the lighter levels: more FPS '
+           'on weak hardware, less detail.',
+           'O jogo sobe o nível de qualidade (0 melhor, 14 mais baixo: LOD mais curto, menos cascatas de sombra, '
+           'menos objetos) em cenas pesadas e desce nas leves. Subir o mínimo mantém os níveis mais leves: '
+           'mais FPS em máquina fraca, menos detalhe.'), lo=0, hi=14),
+    _make('menu:draw_budget', 'menu', 'draw_budget', '', 'int', '100',
+          ('Draw list budget (next start)', 'Orçamento das listas de draw (próximo início)'),
+          ("Share of the game's 24 MB / 10 MB frame command lists. Lower makes the game cut LOD, shadows and detail "
+           'sooner in heavy scenes. Read at start.',
+           'Parte das listas de comandos de 24 MB / 10 MB do quadro. Menor faz o jogo reduzir LOD, sombras e detalhe '
+           'mais cedo em cenas pesadas. Lido na partida.'),
+          lo=10, hi=100, unit='%', live=False, tab='View', hidden=True),
     _menu('View', 'mip_lod_bias', 'float', '0', ('Texture LOD bias (MipLodBias)', 'Bias de LOD das texturas (MipLodBias)'),
           ('Negative: sharper textures at a distance (more shimmer, a little more GPU). Positive: blurrier.',
            'Negativo: texturas mais nítidas ao longe (mais cintilação, um pouco mais de GPU). Positivo: mais borradas.'),
@@ -245,23 +304,43 @@ DIAGNOSTICS = [
         ('Still crashes the game on the NVIDIA 595 driver; off by default in this port.',
          'Ainda derruba o jogo no driver NVIDIA 595; desligado por padrão neste port.'),
         broken=True),
-    _ab_choice('renderer', 'TLG_RENDERER', '1',
+    # Windows default: renderer v2 with its native passes (RTX 3060 + Ryzen 5 5500 / 4600G, 2026-10-21:
+    # 11-20 FPS in gameplay with the previous v2 defaults, ~40-45 FPS with native passes and
+    # gpu_v2/defaults.env's unified memory off). Linux keeps this port's renderer: native passes
+    # crash NVIDIA's Linux driver.
+    _ab_choice('renderer', 'TLG_RENDERER', '2' if _WINDOWS else '1',
                (('1', '1 · This port\'s renderer', '1 · Renderer deste port'),
                 ('2', '2 · Renderer v2 (experimental)', '2 · Renderer v2 (experimental)')),
                ('Renderer', 'Renderer'),
                ('Renderer v2 (port/gpu_v2): another renderer with this port\'s interface, its own fixes and '
-                'its own shader cache (the first start compiles the shaders again). Needs the v2 build '
-                '(TLG_RENDERER_V2=1 build.sh); without it the game starts with this port\'s renderer.',
+                'its own shader cache (the first start compiles the shaders again). The default on Windows. '
+                'Needs the v2 build (TLG_RENDERER_V2=1 build.sh); without it the game starts with this '
+                'port\'s renderer.',
                 'Renderer v2 (port/gpu_v2): outro renderer com a interface deste port, as próprias correções e '
-                'o próprio cache de shaders (a primeira partida compila os shaders de novo). Precisa do build '
-                'v2 (TLG_RENDERER_V2=1 build.sh); sem ele o jogo abre com o renderer deste port.'),
+                'o próprio cache de shaders (a primeira partida compila os shaders de novo). O padrão no '
+                'Windows. Precisa do build v2 (TLG_RENDERER_V2=1 build.sh); sem ele o jogo abre com o '
+                'renderer deste port.'),
                source='launcher (infamous_run.py)', pass_env=False),
-    _ab('native_passes', 'TLG_NATIVE_PASSES', False, False, False,
+    _ab('native_passes', 'TLG_NATIVE_PASSES', _WINDOWS, False, False,
         ('Native passes (renderer v2 only)', 'Native passes (só no renderer v2)'),
-        ('Renderer v2 records the game\'s draws straight into Vulkan when the game submits them. Off by '
-         'default: on NVIDIA\'s Linux driver it can drop frames or crash. Has no effect on this port\'s renderer.',
-         'O renderer v2 grava os desenhos do jogo direto no Vulkan quando o jogo os envia. Desligado por '
-         'padrão: no driver NVIDIA do Linux pode derrubar quadros ou travar. Não tem efeito no renderer deste port.'),
+        ('Renderer v2 records the game\'s draws straight into Vulkan when the game submits them. On by '
+         'default on Windows; off on Linux, where NVIDIA\'s driver can drop frames or crash with them. '
+         'Has no effect on this port\'s renderer.',
+         'O renderer v2 grava os desenhos do jogo direto no Vulkan quando o jogo os envia. Ligado por '
+         'padrão no Windows; desligado no Linux, onde o driver NVIDIA pode derrubar quadros ou travar. '
+         'Não tem efeito no renderer deste port.'),
+        pass_env=False),
+    # Windows default off: with it on, the game's fences wait for the GPU ~28 times a frame (11-20 FPS
+    # in gameplay, RTX 3060 + Ryzen 5 5500, 2026-10-21). Castlesea's release has it on but its heap
+    # range never matches there, so it measures without it.
+    _ab('v2_unified_memory', 'ISS_UNIFIED_MEMORY', not _WINDOWS, False, False,
+        ('Unified memory (renderer v2 only)', 'Memória unificada (só no renderer v2)'),
+        ('Renderer v2 shares the game\'s per-frame heap with the GPU, as on the PS4, so the game waits for '
+         'the GPU to finish before it reuses that memory. Off by default on Windows, where it held the game '
+         'at 11-20 FPS; on on Linux. Has no effect on this port\'s renderer.',
+         'O renderer v2 compartilha com a GPU o heap de dados por quadro do jogo, como no PS4, e o jogo '
+         'espera a GPU terminar antes de reusar essa memória. Desligado por padrão no Windows, onde segurava '
+         'o jogo em 11-20 FPS; ligado no Linux. Não tem efeito no renderer deste port.'),
         pass_env=False),
     _ab_choice('occlusion_mode', 'TLG_OCCLUSION_MODE', '4',
                (('0', '0 · As before (fake counter, glare may show through)', '0 · Como antes (contador falso, o brilho pode atravessar)'),

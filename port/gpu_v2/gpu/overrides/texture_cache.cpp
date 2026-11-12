@@ -7,12 +7,17 @@
 #include <thread>
 #include <unordered_map>
 #include "gpu_blackbox.h"
+#include "guest_heap_census.h"
 #include "native_passes.h"
+#include "vram_stats.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <set>
 #include <xxhash.h>
+#include "../../../src/iss_native_live.h"
+#include "../../../src/iss_native_target_policy.h"
+#include <unordered_set>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -45,6 +50,37 @@ static bool GcTextureOnly() {
         return p && p[0] == '1';
     }();
     return on;
+}
+
+static bool NativeResizeTargetFix() {
+    static const bool enabled = [] {
+        const char* p=std::getenv("ISS_NATIVE_LIVE_TARGET_FIX");
+        return iss_native_live_option(p)!=0;
+    }();
+    return enabled && runtime_native_live_enabled();
+}
+
+// Private live-resize investigation. CP-thread-local, bounded once per resize;
+// observes actual cache decisions without clearing or invalidating resources.
+static bool NativeResizeTrace(u64 key, unsigned lane) {
+    static const bool enabled = [] {
+        const char* p = std::getenv("ISS_NATIVE_LIVE_TARGET_TRACE");
+        return p && p[0] == '1';
+    }();
+    if (!enabled) return false;
+    const auto generation = runtime_native_live_generation();
+    if (!generation) return false;
+    struct Trace {
+        u32 generation{};
+        std::unordered_set<u64> keys[2];
+    };
+    static thread_local Trace trace;
+    if (trace.generation != generation) {
+        trace = {};
+        trace.generation = generation;
+    }
+    auto& keys = trace.keys[lane];
+    return keys.size() < 96 && keys.insert(key).second;
 }
 
 static constexpr u64 PageShift = 12;
@@ -300,6 +336,20 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     trigger_gc_memory = std::max<u64>(trigger_gc_memory, u64(std::max<s64>(relaxed, 0)));
     if (const char* p = std::getenv("ISS_GC_TRIGGER_MB"))
         trigger_gc_memory = u64(std::strtoull(p, nullptr, 10)) << 20;
+    base_trigger_gc_memory = trigger_gc_memory;
+    base_pressure_gc_memory = pressure_gc_memory;
+    base_critical_gc_memory = critical_gc_memory;
+    card_budget_memory = u64(device_local_memory);
+    // ISS_GC_BUDGET_MB: the launcher's VRAM budget (3500 by default). Only the first renderer
+    // read it: renderer v2 aimed at the driver's budget, critical at 5 GB on 8 GB cards, and
+    // ran out of VRAM (2026-10-21, RX 6600 / RTX 5050 / RTX 5060).
+    if (const char* p = std::getenv("ISS_GC_BUDGET_MB"); p && *p) {
+        if (std::strcmp(p, "auto") == 0) auto_gc_budget = true;
+        else forced_gc_budget = u64(std::strtoull(p, nullptr, 10)) << 20;
+    }
+    RefreshGcLimits();
+    // steam-deck: ISS_GC_TEXTURE_ONLY=1 fica com os limites calibrados no Deck (o RefreshGcLimits nao roda de novo
+    // nesse modo, ver GarbageCollectImages).
     if (GcTextureOnly()) {
         const auto mb = [](const char* name, u64 fallback) {
             const char* p = std::getenv(name);
@@ -308,12 +358,84 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         trigger_gc_memory = mb("ISS_GC_TRIGGER_MB", 1536);
         pressure_gc_memory = mb("ISS_GC_PRESSURE_MB", 2048);
         critical_gc_memory = mb("ISS_GC_CRITICAL_MB", 2560);
+        base_trigger_gc_memory = trigger_gc_memory;
+        base_pressure_gc_memory = pressure_gc_memory;
+        base_critical_gc_memory = critical_gc_memory;
         std::fprintf(stderr, "TEXTURE_GC texture_only=1 (mede so as texturas)\n");
     }
-    std::fprintf(stderr, "TEXTURE_GC budget=%lld MB trigger=%llu MB pressure=%llu MB critical=%llu MB\n",
-                 (long long)(device_local_memory >> 20), (unsigned long long)(trigger_gc_memory >> 20),
+    std::fprintf(stderr, "TEXTURE_GC budget=%lld MB forced=%llu MB image_budget=%d device_guard=%llu MB trigger=%llu MB pressure=%llu MB critical=%llu MB\n",
+                 (long long)(device_local_memory >> 20), (unsigned long long)(forced_gc_budget >> 20),
+                 int(ImageBudgetMode()), (unsigned long long)(device_guard_memory >> 20),
+                 (unsigned long long)(trigger_gc_memory >> 20),
                  (unsigned long long)(pressure_gc_memory >> 20),
                  (unsigned long long)(critical_gc_memory >> 20));
+}
+
+// ISS_GC_IMAGE_BUDGET (default on, =0 the old rule): the launcher's VRAM budget (ISS_GC_BUDGET_MB)
+// bounds the texture cache, as its name says, instead of the whole device's usage. Since #497 the
+// rest of renderer v2 (arena, staging, driver) holds ~2.3 GB on its own: compared with the device's
+// usage, a 3500 MB budget kept the collector deleting textures all the time (RTX 2060, 2026-10-22).
+// The device stays guarded: above card - ISS_VRAM_HEADROOM_MB (95% of larger cards) it runs critical.
+bool TextureCache::ImageBudgetMode() const {
+    static const bool enabled = [] {
+        const char* p = std::getenv("ISS_GC_IMAGE_BUDGET");
+        return !p || p[0] != '0';
+    }();
+    return enabled && (forced_gc_budget != 0 || auto_gc_budget);
+}
+
+void TextureCache::RefreshGcLimits() {
+    // The driver's budget now: lower than at startup when other programs hold VRAM, and the
+    // only meaningful one on integrated GPUs.
+    // The startup budget can come in low (another program holding VRAM as the game starts: 4924
+    // MB, then 5394, RTX 2060): the device guard then sat under the normal usage and the collector
+    // ran critical all the time. The current budget, both ways.
+    const u64 now = instance.GetDeviceMemoryBudgetNow();
+    u64 card = card_budget_memory;
+    if (now != 0) {
+        card = now;
+    }
+    trigger_gc_memory = base_trigger_gc_memory;
+    pressure_gc_memory = base_pressure_gc_memory;
+    critical_gc_memory = base_critical_gc_memory;
+    // Usage counts every allocation (buffers, swapchain, staging), not only images: on smaller
+    // discrete cards keep a headroom free whatever the budget says.
+    device_guard_memory = card / 100 * 95;
+    if (!instance.IsIntegrated() && card <= u64(SMALL_CARD_MEMORY)) {
+        // ISS_VRAM_HEADROOM_MB (default 768): 1.5 GB dated from the arena jumping by gigabytes
+        // (#497 ended that: 12 MB at most in a walk through the city); with it the automatic budget
+        // left 1.8 GB of a 6 GB card unused while the collector deleted 16k textures (2026-10-22).
+        static const u64 headroom = [] {
+            const char* p = std::getenv("ISS_VRAM_HEADROOM_MB");
+            return u64(p ? std::strtoull(p, nullptr, 10) : 768) << 20;
+        }();
+        device_guard_memory = std::max<u64>(card > headroom ? card - headroom : 0,
+                                            card / 2);
+    }
+    u64 budget = forced_gc_budget ? std::min(forced_gc_budget, card) : 0;
+    // ISS_GC_BUDGET_MB=auto: the textures get what the device guard leaves after everything else
+    // (arena, staging, swapchain, the driver), measured now: any card, other programs' VRAM and
+    // the arena growing in new areas included. 512 MB at least.
+    if (auto_gc_budget && instance.CanReportMemoryUsage()) {
+        const u64 usage = instance.GetDeviceMemoryUsage();
+        const u64 others = usage > image_bytes ? usage - image_bytes : 0;
+        auto_budget_memory =
+            std::max<u64>(device_guard_memory > others ? device_guard_memory - others : 0, 512ull << 20);
+        budget = auto_budget_memory;
+    }
+    if (budget == 0 && instance.IsIntegrated()) {
+        budget = card;
+    }
+    if (budget != 0) {
+        trigger_gc_memory = budget / 10 * 7;
+        pressure_gc_memory = budget / 100 * 85;
+        critical_gc_memory = budget / 100 * 95;
+    }
+    // In image budget mode the limits apply to the images alone and the guard above to the
+    // device; otherwise both are the device's usage.
+    if (!ImageBudgetMode()) critical_gc_memory = std::min(critical_gc_memory, device_guard_memory);
+    pressure_gc_memory = std::min(pressure_gc_memory, critical_gc_memory);
+    trigger_gc_memory = std::min(trigger_gc_memory, pressure_gc_memory);
 }
 
 TextureCache::~TextureCache() {
@@ -517,7 +639,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             MarkAsMaybeDirty(image_id, image);
         }
     });
-    // ISS_TEX_FAULT_STREAK_KB (default 256, 0 off): a guest thread writing on through image
+    // ISS_TEX_FAULT_STREAK_KB (default 0, opt-in): a guest thread writing on through image
     // pages it faults on one after the other gets the images of the next window marked maybe
     // dirty now (hashed, untracked: re-uploaded at their next use only if their bytes changed),
     // as their faults would do one by one. Every ~2 s the game copies ~11 MB over a pool of
@@ -525,7 +647,12 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     // (the "mini frame skips", 2026-10-17).
     static const u64 streak_bytes = [] {
         const char* setting = std::getenv("ISS_TEX_FAULT_STREAK_KB");
-        const u64 kb = setting ? std::strtoull(setting, nullptr, 10) : 256;
+        // Native ultrawide streaming freeze, 2026-10-22: the speculative
+        // MarkAsMaybeDirty below can hash a GPU-protected page while holding
+        // mutex. Its nested read fault queues a readback and waits for the CP,
+        // which can itself be waiting for this mutex in FindImage. Keep normal
+        // per-page invalidation; do not hash ahead from the guest fault handler.
+        const u64 kb = setting ? std::strtoull(setting, nullptr, 10) : 0;
         return std::min<u64>(kb, 4096) * 1024;
     }();
     if (size <= 8 && streak_bytes != 0) {
@@ -1205,6 +1332,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         desc.view_info.range.base.layer = view_slice;
     }
 
+    if ((desc.type == BindingType::RenderTarget || desc.type == BindingType::DepthTarget) &&
+        NativeResizeTrace((image.image_uid << 32) ^ (u64(info.size.width) << 16) ^ info.size.height, 0)) {
+        std::fprintf(stderr, "NATIVE_RESIZE_BIND epoch=%u uid=%llu kind=%d addr=%llx requested=%ux%u resolved=%ux%u pitch=%u/%u bytes=%llu/%llu\n",
+            runtime_native_live_generation(), (unsigned long long)image.image_uid, int(desc.type),
+            (unsigned long long)info.guest_address, info.size.width, info.size.height,
+            image.info.size.width, image.info.size.height, info.pitch, image.info.pitch,
+            (unsigned long long)info.guest_size, (unsigned long long)image.info.guest_size);
+    }
     return image_id;
 }
 
@@ -1243,6 +1378,26 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
                     size);
     }
     return {};
+}
+
+ImageId TextureCache::FindImageAt(VAddr address, u32 width, u32 height, vk::ImageUsageFlags required_usage) {
+    AssertNoAscTextureAccess();
+    ImageId best{};
+    u64 best_tick = 0;
+    if (const auto it = image_address_index.find(address); it != image_address_index.end()) {
+        for (const ImageId image_id : it->second) {
+            const Image& image = slot_images[image_id];
+            if (image.info.size.width != width || image.info.size.height != height ||
+                image.info.num_samples != 1 || (image.usage_flags & required_usage) != required_usage) {
+                continue;
+            }
+            if (!best || image.tick_accessed_last > best_tick) {
+                best = image_id;
+                best_tick = image.tick_accessed_last;
+            }
+        }
+    }
+    return best;
 }
 
 void TextureCache::ReportLookupMemo() const {
@@ -1354,11 +1509,22 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // Register meta data for this depth buffer (once: the image remembers it)
     if (desc.info.meta_info.htile_addr &&
-        image.info.meta_info.htile_addr != desc.info.meta_info.htile_addr) {
+        (image.info.meta_info.htile_addr != desc.info.meta_info.htile_addr ||
+         (NativeResizeTargetFix() && !surface_metas.contains(desc.info.meta_info.htile_addr)))) {
         RegisterSurfaceMeta(desc.info.meta_info.htile_addr,
                               MetaDataInfo{.type = MetaType::HTile,
                                            .clear_mask = image.info.meta_info.htile_clear_mask});
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
+    }
+
+    if (NativeResizeTrace(image.image_uid, 1)) {
+        const auto it = surface_metas.find(desc.info.meta_info.htile_addr);
+        std::fprintf(stderr, "NATIVE_RESIZE_DEPTH epoch=%u uid=%llu size=%ux%u htile=%llx mask=%x initial=%x found=%d\n",
+            runtime_native_live_generation(), (unsigned long long)image.image_uid,
+            image.info.size.width, image.info.size.height,
+            (unsigned long long)desc.info.meta_info.htile_addr,
+            it == surface_metas.end() ? 0u : u32(it.value().clear_mask),
+            image.info.meta_info.htile_clear_mask, it != surface_metas.end());
     }
 
     // If there is a stencil attachment, link depth and stencil.
@@ -1378,6 +1544,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                 cached && slot_images.is_allocated(cached->id)) {
                 const auto& stencil = slot_images[cached->id];
                 if (stencil.image_uid == cached->uid &&
+                    (!NativeResizeTargetFix() || stencil.info.size == desc.info.size) &&
                     True(stencil.flags & ImageFlagBits::Registered)) {
                     stencil_id = cached->id;
                     ++lookup_counts.stencil_hits;
@@ -1389,6 +1556,9 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                 if (image.info.guest_address != desc.info.stencil_addr) {
                     return;
                 }
+                // axylpup/shadPS4 3a4db206: old-size planes at the same
+                // address must not override the plane for this depth image.
+                if (NativeResizeTargetFix() && image.info.size != desc.info.size) return;
                 if (image.info.pixel_format == vk::Format::eUndefined ||
                     Vulkan::LiverpoolToVK::IsFormatStencilCompatible(image.info.pixel_format)) {
                     stencil_id = image_id;
@@ -1677,6 +1847,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     BumpGeneration();
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    image_bytes += Common::AlignUp(image.info.guest_size, 1024);
     {
         std::scoped_lock lru{lru_lock};
         image.lru_id = lru_cache.Insert(image_id, gc_tick);
@@ -1713,6 +1884,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
         lru_cache.Free(image.lru_id);
     }
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    image_bytes -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         if (page_it == nullptr) {
@@ -1883,8 +2055,68 @@ void TextureCache::GarbageCollectImages() {
                      (unsigned long long)tex_streak_images.load(),
                      (unsigned long long)(total_used_memory >> 20),
                      (unsigned long long)(trigger_gc_memory >> 20));
+    if (gc_tick % 600 == 0 && instance.CanReportMemoryUsage()) {
+        // Where the VRAM goes: the collector only frees images; the arena (guest memory the
+        // GPU used, resident for good) and the rest (staging, pipelines, swapchain) stay.
+        const u64 usage = instance.GetDeviceMemoryUsage();
+        const u64 arena =
+            buffer_cache.ArenaResidentBytes(false) - buffer_cache.ArenaResidentBytes(true);
+        const u64 known = image_bytes + arena;
+        if (auto_gc_budget)
+            std::fprintf(stderr, "TEXTURE_BUDGET_AUTO textures=%llu MB guard=%llu MB\n",
+                         (unsigned long long)(auto_budget_memory >> 20),
+                         (unsigned long long)(device_guard_memory >> 20));
+        std::fprintf(stderr,
+                     "VRAM_BREAKDOWN usage=%llu MB budget_now=%llu MB images=%llu MB arena=%llu MB "
+                     "arena_spilled=%llu MB other=%llu MB critical=%llu MB\n",
+                     (unsigned long long)(usage >> 20),
+                     (unsigned long long)(instance.GetDeviceMemoryBudgetNow() >> 20),
+                     (unsigned long long)(image_bytes >> 20), (unsigned long long)(arena >> 20),
+                     (unsigned long long)(buffer_cache.ArenaResidentBytes(true) >> 20),
+                     (unsigned long long)((usage > known ? usage - known : 0) >> 20),
+                     (unsigned long long)(critical_gc_memory >> 20));
+        {
+            namespace vs = iss::vram_stats;
+            std::fprintf(stderr, "VRAM_OTHER");
+            for (int k = 0; k < vs::KindCount; ++k)
+                std::fprintf(stderr, " %s=%llu MB", vs::KindNames[k],
+                             (unsigned long long)(vs::Bytes(k) >> 20));
+            std::fprintf(stderr, " | arena by reason: buffers=%llu MB image_sources=%llu MB gpu_writes=%llu MB\n",
+                         (unsigned long long)(buffer_cache.ArenaReasonBytes(0) >> 20),
+                         (unsigned long long)(buffer_cache.ArenaReasonBytes(1) >> 20),
+                         (unsigned long long)(buffer_cache.ArenaReasonBytes(2) >> 20));
+        }
+        // What the game holds of its GPU heaps (live) against the span it reached: the arena
+        // can only shrink to the live part.
+        iss::heap_census::Heap h[2];
+        if (iss::heap_census::Read(h)) {
+            for (int i = 0; i < 2; ++i)
+                std::fprintf(stderr,
+                             "HEAP_CENSUS heap=%d live=%llu MB peak=%llu MB span=%llu MB "
+                             "allocs=%llu frees=%llu\n",
+                             i, (unsigned long long)(h[i].live_bytes >> 20),
+                             (unsigned long long)(h[i].peak_bytes >> 20),
+                             (unsigned long long)((h[i].highest - h[i].lowest) >> 20),
+                             (unsigned long long)h[i].allocs, (unsigned long long)h[i].frees);
+        }
+    }
+    // steam-deck: com ISS_GC_TEXTURE_ONLY=1 o uso conta so as texturas (total_used_memory, somado no registro) e
+    // os limites ficam os do Deck: o uso do aparelho inclui a memoria compartilhada e apagava texturas todo quadro.
     if (instance.CanReportMemoryUsage() && !GcTextureOnly()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+        const u64 device = instance.GetDeviceMemoryUsage();
+        if (gc_tick % 60 == 0) {
+            RefreshGcLimits();
+        }
+        total_used_memory = device;
+        if (ImageBudgetMode()) {
+            // The images against the budget; the device's usage only escalates.
+            total_used_memory = image_bytes;
+            if (device >= device_guard_memory) {
+                total_used_memory = std::max(total_used_memory, critical_gc_memory);
+            } else if (device + (512ull << 20) >= device_guard_memory) {
+                total_used_memory = std::max(total_used_memory, pressure_gc_memory);
+            }
+        }
     }
     // steam-deck: guarda da memoria do sistema. No Deck a GTT sai da RAM: com o jogo em ~4 GB de RAM e ~8,8 GB de
     // GTT sobravam ~500 MB, e o menu da Steam travou o gamescope esperando memoria (2026-10-24). Abaixo de
@@ -1950,6 +2182,8 @@ void TextureCache::GarbageCollectImages() {
         const char* p = std::getenv("ISS_GC_RECENT_USE");
         return !p || p[0] != '0';
     }();
+    // A pass stops after looking at 256 images.
+    u32 visited = 0;
     const auto clean_up = [&](ImageId image_id) {
         if (num_deletions == 0) {
             return true;
@@ -1973,18 +2207,22 @@ void TextureCache::GarbageCollectImages() {
                 return false;
             }
         }
-        deleted.fetch_add(1, std::memory_order_relaxed);
-        --num_deletions;
+        if (++visited > 256) {
+            return true;
+        }
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
+        if ((tiled && download) || (download && !pressured)) {
+            // Tiled: we can't handle non-linear image downloads yet. Otherwise a download
+            // waits for memory pressure. Either way the image moves to the back of the queue
+            // (bloodborne_pc 0.3, ported from the first renderer): left at the front, the
+            // GPU-written targets were looked at again every pass while VRAM kept growing.
+            lru_cache.Touch(image.lru_id, gc_tick);
             return false;
         }
-        if (download && !pressured) {
-            return false;
-        }
+        deleted.fetch_add(1, std::memory_order_relaxed);
+        --num_deletions;
         if (download) {
             DownloadImageMemory(image_id);
         }
@@ -2014,6 +2252,7 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
+        visited = 0;
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
 }
@@ -2065,6 +2304,57 @@ void TextureCache::RunGarbageCollector() {
         ++gc_tick;
     };
     gc_scheduler_ticks[gc_tick % gc_scheduler_ticks.size()] = scheduler.CurrentTick();
+
+    // GPL adaptation of axylpup/shadPS4 PurgeOldRenderSize. Run only on the
+    // owning CP thread at its existing frame boundary, never in a guest hook.
+    // Registry iteration uses this port's locked address index, not an LRU
+    // walk that recording threads might update. FreeImage defers Vulkan and
+    // recorded-job reclamation through the existing scheduler.
+    if (NativeResizeTargetFix()) {
+        struct PendingPurge {
+            const TextureCache* owner{};
+            u32 serial{}, completed{}, attempts{};
+            u32 sizes[4]{};
+        };
+        static thread_local PendingPurge purge;
+        if (purge.owner != this) { purge={}; purge.owner=this; }
+        u32 sizes[4]{};
+        const u32 serial=runtime_native_live_purge_plan(sizes);
+        if (serial && serial!=purge.serial) {
+            purge.serial=serial;purge.attempts=0;
+            std::copy(std::begin(sizes),std::end(sizes),purge.sizes);
+        }
+        if (purge.serial!=purge.completed && gc_tick && ++purge.attempts<=3000) {
+            std::scoped_lock lock{mutex};
+            const u64 since=gc_scheduler_ticks[(gc_tick-1)%gc_scheduler_ticks.size()];
+            std::vector<ImageId> stale;
+            bool new_size_seen=false;
+            for (const auto& [address,ids] : image_address_index) {
+                (void)address;
+                for (const auto id : ids) {
+                    const auto& image=slot_images[id];
+                    if (False(image.flags & ImageFlagBits::Registered)) continue;
+                    const u32 w=image.info.size.width,h=image.info.size.height;
+                    const bool used=!since || image.tick_accessed_last>=since;
+                    if (used && (image.usage.render_target||image.usage.depth_target) &&
+                        w==purge.sizes[2] && h==purge.sizes[3]) new_size_seen=true;
+                    if (iss_native_retire_target(w,h,purge.sizes,used,image.usage.vo_surface))
+                        stale.push_back(id);
+                }
+            }
+            if (new_size_seen) {
+                std::sort(stale.begin(),stale.end(),[](ImageId a,ImageId b){return a.index<b.index;});
+                stale.erase(std::unique(stale.begin(),stale.end()),stale.end());
+                for (const auto id : stale) {
+                    learned_extents.erase(slot_images[id].info.guest_address);
+                    FreeImage(id);
+                }
+                purge.completed=purge.serial;
+                std::fprintf(stderr,"NATIVE_RESIZE_PURGE serial=%u old=%ux%u new=%ux%u retired=%zu\n",
+                    purge.serial,purge.sizes[0],purge.sizes[1],purge.sizes[2],purge.sizes[3],stale.size());
+            }
+        }
+    }
 
     GarbageCollectImages();
     GarbageCollectSamplers();

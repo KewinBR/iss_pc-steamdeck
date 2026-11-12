@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Writes the "what changed" part of the release notes (pt-BR and en-US) to stdout: every PR
+# Writes the "what changed" part of the release notes (en-US, then pt-BR) to stdout: every PR
 # merged since the previous release, with the issues it fixes and who opened them.
 #
 # Each PR body carries its notes between these markers (one "- " line per change):
@@ -13,7 +13,7 @@
 # Usage: release_notes.sh <commit sha>   (needs GH_TOKEN and GH_REPO)
 set -euo pipefail
 sha=$1
-prev=${PREV:-}; [[ -n $prev ]] || prev=$(gh release list --exclude-drafts --limit 20 --json tagName --jq '.[].tagName' | grep -vx nightly | head -1 || true)
+prev=${PREV:-}; [[ -n $prev ]] || prev=$(gh release list --exclude-drafts --limit 100 --json tagName --jq '.[].tagName' | grep -vxE 'nightly|beta-.*' | head -1 || true)
 if [[ -n $prev ]]; then
   commits=$(gh api --paginate "repos/$GH_REPO/compare/$prev...$sha?per_page=100" --jq '.commits[].sha')
 else
@@ -56,11 +56,11 @@ thanks=""
 for i in $(printf '%s\n' "${!authors[@]}" | sed '/^$/d' | sort -n); do thanks+="#$i (@${authors[$i]}), "; done
 thanks=${thanks%, }
 
-echo "## Novidades"
-printf '%s' "$pt"
-[[ -n $thanks ]] && echo && echo "Issues relatadas por: $thanks. Obrigado!"
-echo
 echo "## What's new"
 printf '%s' "$en"
 [[ -n $thanks ]] && echo && echo "Reported by: $thanks. Thank you!"
+echo
+echo "## Novidades"
+printf '%s' "$pt"
+[[ -n $thanks ]] && echo && echo "Issues relatadas por: $thanks. Obrigado!"
 echo

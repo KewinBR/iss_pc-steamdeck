@@ -7,6 +7,7 @@ changed: the preset lists them at the game's native values, so applying it puts 
 Left out on purpose (they depend on the machine): the VRAM budget, window mode, languages, and the
 AMD workarounds (BLOCK1D, BC_TINY, NO_MSAA), which stay on "Automatic".
 """
+import os
 
 CURRENT = {
     'id': 'current',
@@ -37,10 +38,13 @@ CURRENT = {
         'BP07': '1',
         'BP08': '1',
         'TLG_BARRIER_MERGE': '0',
-        # this port's renderer (presets_v2.py has the renderer v2 ones): listed so that applying this
-        # preset after RENDERER V2 brings the renderer back
+        # this port's renderer (presets_v2.py has the renderer v2 ones, RENDERER V2 + NATIVE PASSES is
+        # the Windows default): listed so that applying this preset after RENDERER V2 brings the renderer back
         'TLG_RENDERER': '1',
         'TLG_NATIVE_PASSES': '0',
+        # renderer v2's unified memory at its default (backports_table.py: off on Windows), inherited by
+        # the renderer v2 presets
+        'ISS_UNIFIED_MEMORY': '0' if os.name == 'nt' else '1',
     },
     # in the export for reference, never applied
     'not_applied': {

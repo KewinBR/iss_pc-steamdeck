@@ -1,4 +1,6 @@
 #include <shared_mutex>
+#include "../../../src/iss_native_resolution.h"
+#include "../../../src/iss_warning_budget.h"
 #include <algorithm>
 #include "parallel.h"
 #include "native_item_identity.h"
@@ -15,6 +17,7 @@
 #include "infamous_renderer/secondary_batch_probe.h"
 #include <unordered_set>
 #include <cstdio>
+#include <filesystem>
 #include <intrin.h>
 #include <span>
 #include <unordered_map>
@@ -51,6 +54,8 @@ namespace iss::diagnostics {void RecordFeedbackBinding(u64 address,u64 size,u64 
 #include "common/perf_stats.h"
 #include "runtime_timeline.h"
 #include "compute_phase.h"
+#include "iss_temporal_upscaler.h"
+#include "tlg_settings.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -730,6 +735,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
       occlusion{instance, scheduler} {
+    IssTemporal::Probe(instance);
     if (const char* value = std::getenv("ISS_CP_SPLIT_PREPARE_SERIAL");
         value && value[0] == '1') {
         // Exercise the thread-local queue selection and owner scratch on the existing
@@ -1378,7 +1384,9 @@ std::size_t Rasterizer::Draw(bool is_indexed, u32 index_offset,
     // ISS_NATIVE_PASSES learn request: the full path (DrawRecord), which keeps the template.
     const bool pass_learn = native_pass_learn != 0 && !pipelined;
     // Pause guard (pause_guard.h): in the pause every native/fast path below is off.
-    const bool native_off = pass_learn || iss::pause_guard::Blocked();
+    // While the draws are redirected to output-size twins (IssTemporal), only the draw paths that scale their
+    // own viewport and push constants (DrawRecord, DrawIndirect) may run.
+    const bool native_off = pass_learn || iss::pause_guard::Blocked() || (iss_temporal && iss_temporal->UiActive());
     if(!pipelined){DrainDrawPipe(5);SubmitAfterSegments(scheduler);SubmitFeedbackBatch(scheduler);PeriodicSubmit(scheduler);}
     iss::diagnostics::Scope phase_scope(iss::diagnostics::Draw);
     RENDERER_TRACE;
@@ -1554,6 +1562,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline,bool is_indexed,u32
     if (cycles) g_draw_cycles.Mark(7);
 
     IssCpLayoutCheck(*pipeline, set_writes.data(), u32(set_writes.size()));
+    if (iss_ui_scale_x != 1.0f) IssUiScalePushData();
     pipeline->BindResources(set_writes, push_data);
     if (cycles) g_draw_cycles.Mark(8);
     UpdateDynamicState(pipeline, is_indexed);
@@ -1642,13 +1651,18 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline,bool is_indexed,u32
         DumpAfter(pipeline);
     }
     if (cycles) g_draw_cycles.Mark(11);
-    if (FastDrawEnabled()) {
+    // A redirected draw's state is not one a fast draw may repeat (it points at this frame's twins).
+    const bool ui_draw = iss_ui_scale_x != 1.0f;
+    if (FastDrawEnabled() && !ui_draw) {
         CaptureFastDraw(pipeline, is_indexed, state);
     }
     NoteDrawCensus(state, 4, pipeline, DrawRegs());
     ResetBindings(false);
-    if (FastDrawEnabled()) {
+    if (FastDrawEnabled() && !ui_draw) {
         FinishFastDraw();
+    }
+    if (ui_draw) {
+        fast_draw.valid = false;
     }
     if (cycles) {
         g_draw_cycles.Mark(12);
@@ -1790,6 +1804,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         runtime.FlushBarriers();
     }
 
+    if (iss_ui_scale_x != 1.0f) IssUiScalePushData();
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -3016,6 +3031,15 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     const auto& cs_program=DrawCsRegs();
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     const bool feedback=WritesFeedbackRecord(cs);
+    static const bool light_dispatch_trace=[]{const char* p=std::getenv("ISS_NATIVE_LIGHT_TRACE");return p&&p[0]=='1';}();
+    if(light_dispatch_trace&&(u32(cs.pgm_hash)==0xce1675e0u||u32(cs.pgm_hash)==0xa8b68717u)){
+        const auto plan=*runtime_native_plan();
+        const u64 key=cs.pgm_hash^(u64(plan.width)<<32)^(u64(plan.height)<<16);
+        static thread_local std::unordered_set<u64> seen;
+        if(seen.size()<32&&seen.insert(key).second)
+            std::fprintf(stderr,"NATIVE_LIGHT_DISPATCH shader=%llx scene=%ux%u groups=%ux%ux%u\n",
+                (unsigned long long)cs.pgm_hash,plan.width,plan.height,cs_program.dim_x,cs_program.dim_y,cs_program.dim_z);
+    }
     if(!feedback)SubmitFeedbackBatch(scheduler);
     if (ExecuteShaderHLE(cs, DrawRegs(), cs_program, *this)) {
         if (g_dump.frames_left != 0) [[unlikely]] {
@@ -3108,6 +3132,37 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     iss::feedback_join::Recorded();
     Sched().ProfileDispatchEnd();
     DebugState.IncDispatch();
+
+    // Private, one-shot exposure investigation. Use the existing scheduler-
+    // synchronized readback helpers after this dispatch, outside cache locks.
+    // Never change shader output, exposure, brightness, or game state.
+    static const bool exposure_capture=[] {
+        const char* p=std::getenv("ISS_NATIVE_EXPOSURE_CAPTURE");return p&&p[0]=='1';
+    }();
+    if(exposure_capture&&u32(cs.pgm_hash)==0xa8b68717u&&!OnDrawWorker()&&
+        !OnComputeRecordQueue()&&!ComputeBindingsActive()&&DrawQueue()==0){
+        static unsigned seen_exposure;static bool captured;
+        if(!captured&&++seen_exposure==240){
+            captured=true;const auto plan=*runtime_native_plan();
+            const std::string prefix=fmt::format("exposure_{}x{}",plan.width,plan.height);
+            std::fprintf(stderr,"NATIVE_EXPOSURE_CAPTURE begin %s after 240 metering dispatches\n",prefix.c_str());
+            unsigned index=0;
+            for(const auto& bound:bound_buffers){
+                if(bound.address&&bound.size&&bound.size<=65536)
+                    DumpBufferToFile(fmt::format("{}_b{}",prefix,index),bound.buffer,bound.offset,bound.address,bound.size);
+                ++index;
+            }
+            unsigned image_index=0;
+            for(const auto& desc:cs.images){
+                const auto tsharp=desc.GetSharp(cs);
+                const u32 width=tsharp.width+1,height=tsharp.height+1;
+                if(tsharp.Address()&&width<=3840&&height<=2160)
+                    texture_cache.DumpImageToFile(tsharp.Address(),fmt::format("{}_image{}",prefix,image_index),width,height);
+                ++image_index;
+            }
+            std::fprintf(stderr,"NATIVE_EXPOSURE_CAPTURE complete %s\n",prefix.c_str());
+        }
+    }
 
     if (g_dump.frames_left != 0) [[unlikely]] {
         DumpAfter(pipeline);
@@ -3278,6 +3333,20 @@ void Rasterizer::OnSubmit() {
             FinishProbes();
         }
     }
+    // Opt-in local diagnostic trigger: consume a file and request two frames.
+    // Check at most once per second; no effect without the environment variable.
+    if(const char* trigger=std::getenv("ISS_FRAME_TRACE_TRIGGER");trigger&&*trigger){
+        static auto last=std::chrono::steady_clock::now();
+        const auto now=std::chrono::steady_clock::now();
+        if(now-last>=std::chrono::seconds(1)){
+            last=now;std::error_code error;
+            if(std::filesystem::remove(trigger,error)){
+                auto& request=Common::Perf::GetTuning().dump_frames;
+                request.store(request.load()==2?3:2);
+                std::fprintf(stderr,"FRAME_TRACE trigger consumed: bounded 2-3 frame capture\n");
+            }
+        }
+    }
     const u32 dump_request =
         Common::Perf::GetTuning().dump_frames.load(std::memory_order_relaxed);
     if (!g_dump.started) {
@@ -3436,9 +3505,18 @@ bool Rasterizer::BindResources(const Pipeline* pipeline,
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = captured_push_data ? *captured_push_data : MakeUserData(DrawRegs());
+    // FSR 3 asks for a sharper mip level while the scene renders below the output: the G-buffer pass (five or
+    // more render targets) samples the material textures with a negative bias. Shadows, post-processing and
+    // the user interface keep the guest's.
+    iss_sampler_lod_bias = 0.0f;
+    if (iss_temporal && !pipeline->IsCompute() &&
+        std::popcount(static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask & 0xffu) >= 5) {
+        iss_sampler_lod_bias = iss_temporal->SceneMipBias();
+    }
     // ISS_NATIVE_MATERIALS learns from the descriptors resolved here, not from a replay.
     const bool stage_memo = StageMemoEnabled() && !captured_push_data && !pipeline->IsCompute() &&
-                            !native_image_capture && StageMemoContextEligible();
+                            !native_image_capture && StageMemoContextEligible() &&
+                            !(iss_temporal && iss_temporal->UiActive());
     if (StageMemoEnabled() && !pipeline->IsCompute() && ++stage_memo_stats.report >= 262144) {
         stage_memo_stats.report = 0;
         ReportStageMemo();
@@ -4249,10 +4327,40 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
-                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                const u64 size = VideoCore::ClampHugeRead(
+                    memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()), desc.is_written);
+                // Bounded, opt-in investigation of native 4K lighting. Observe
+                // actual descriptor/clamp values; never substitute brightness
+                // or modify the lighting buffer, shader or resource bindings.
+                static const bool light_trace=[] {
+                    const char* p=std::getenv("ISS_NATIVE_LIGHT_TRACE");return p&&p[0]=='1';
+                }();
+                if(light_trace && ((u32(stage.pgm_hash)==0xce1675e0u && stage.hw_stage==Shader::HwStage::Compute) ||
+                    (vsharp.GetStride()==2 && vsharp.num_records>=0x320000u && vsharp.num_records<=0x800000u))){
+                    const auto plan=*runtime_native_plan();
+                    const u64 key=stage.pgm_hash ^ (u64(native_index)<<56) ^ (u64(plan.width)<<32) ^
+                        (u64(plan.height)<<16) ^ vsharp.num_records;
+                    static thread_local std::unordered_set<u64> seen;
+                    if(seen.size()<96 && seen.insert(key).second)
+                        std::fprintf(stderr,"NATIVE_LIGHT_BIND shader=%llx stage=%u slot=%u scene=%ux%u addr=%llx stride=%u records=%u requested=%llu bound=%llu write=%d\n",
+                            (unsigned long long)stage.pgm_hash,unsigned(stage.hw_stage),native_index,plan.width,plan.height,
+                            (unsigned long long)vsharp.base_address,unsigned(vsharp.GetStride()),unsigned(vsharp.num_records),
+                            (unsigned long long)vsharp.GetSize(),(unsigned long long)size,int(desc.is_written));
+                }
                 if (size != vsharp.GetSize()) {
-                    LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                    // A recurring descriptor can otherwise emit a warning per draw.
+                    // Preserve the clamp and report the first occurrence plus
+                    // exponentially spaced repeats, with bounded per-thread storage.
+                    static thread_local IssWarningBudget warnings{};
+                    static const bool log_all = [] {
+                        const char* value = std::getenv("ISS_BUFFER_CLAMP_LOG_ALL");
+                        return value && value[0] == '1';
+                    }();
+                    const u64 count = iss_warning_note(&warnings,stage.pgm_hash);
+                    if (log_all || iss_warning_report(count)) {
+                        LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x} (repeat {})",
+                                  vsharp.GetSize(), size, stage.pgm_hash, count);
+                    }
                 }
                 // Correlate the game's 48-byte feedback descriptor with the
                 // EBOOT call-site observation. This is passive: recycled guest
@@ -4305,6 +4413,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                      static_cast<unsigned long long>(observed ? observed->sequence : 0),
                                      static_cast<unsigned long long>(observed ? observed->address_reuses : 0));
                     }
+                }
+                if (size >= (256ull << 20)) {
+                    static std::atomic<u32> huge_logged{};
+                    if (huge_logged.fetch_add(1, std::memory_order_relaxed) < 40)
+                        std::fprintf(stderr,
+                                     "HUGE_BINDING hash=0x%llx stage=%d descriptor=%u base=0x%llx size=%llu MB "
+                                     "stride=%u records=%u written=%d formatted=%d\n",
+                                     (unsigned long long)stage.pgm_hash, int(stage.hw_stage),
+                                     unsigned(&desc - stage.buffers.data()),
+                                     (unsigned long long)vsharp.base_address,
+                                     (unsigned long long)(size >> 20), unsigned(vsharp.GetStride()),
+                                     unsigned(vsharp.num_records), int(desc.is_written),
+                                     int(desc.is_formatted));
                 }
                 bool known_unwritten = false;
                 const bool reuse_check = Common::Perf::GetTuning().reuse_buffer_checks.load(std::memory_order_relaxed);
@@ -4542,11 +4663,26 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_id = texture_cache.FindImage(desc);
             auto* image = &texture_cache.GetImage(image_id);
+            const u32 original_width=image->info.size.width,original_height=image->info.size.height;
+            bool depth_redirect=false;
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
                 // Redirect the access to the actual depth-stencil buffer.
                 image_id = depth_image_id;
                 image = &texture_cache.GetImage(image_id);
+                depth_redirect=true;
+            }
+            static const bool light_image_trace=[]{const char* p=std::getenv("ISS_NATIVE_LIGHT_TRACE");return p&&p[0]=='1';}();
+            if(light_image_trace&&(depth_redirect||u32(stage.pgm_hash)==0xce1675e0u||u32(stage.pgm_hash)==0xa8b68717u)){
+                const auto plan=*runtime_native_plan();
+                const u64 key=stage.pgm_hash^(u64(desc_index)<<56)^(u64(plan.width)<<32)^(u64(plan.height)<<16)^image->image_uid;
+                static thread_local std::unordered_set<u64> seen;
+                if(seen.size()<192&&seen.insert(key).second)
+                    std::fprintf(stderr,"NATIVE_LIGHT_IMAGE shader=%llx slot=%u scene=%ux%u requested=%ux%u cached=%ux%u actual=%ux%u redirect=%d kind=%u format=%u uid=%llu\n",
+                        (unsigned long long)stage.pgm_hash,desc_index,plan.width,plan.height,
+                        desc.info.size.width,desc.info.size.height,original_width,original_height,
+                        image->info.size.width,image->info.size.height,int(depth_redirect),unsigned(desc.type),unsigned(image->info.pixel_format),
+                        (unsigned long long)image->image_uid);
             }
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we
@@ -4668,8 +4804,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_infos.emplace_back(VK_NULL_HANDLE, *image_view->image_view,
-                                     image.backing->state.layout);
+            vk::ImageView sampled_view = *image_view->image_view;
+            vk::ImageLayout sampled_layout = image.backing->state.layout;
+            if (!is_storage && iss_temporal && iss_temporal->UiActive()) {
+                // Drawing below the output size: the image has an output-size twin written this frame.
+                iss_temporal->RedirectSampled(image_id, desc.view_info, sampled_view, sampled_layout);
+            }
+            image_infos.emplace_back(VK_NULL_HANDLE, sampled_view, sampled_layout);
             if (native_image_capture) {
                 native_image_capture->push_back(NativeImageCapture{
                     .id = image_id,
@@ -4716,6 +4857,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         static_cast<u32>(ssharp.border_color_type.Value()),
                         DrawRegs().ta_bc_base.Address());
             ssharp = AmdGpu::Sampler{};
+        }
+        if (iss_sampler_lod_bias != 0.0f && !sampler.is_depth) {
+            // The S# keeps the bias in 1/256 steps, 14 bits, signed.
+            const float biased = std::clamp(ssharp.LodBias() + iss_sampler_lod_bias, -31.0f, 31.0f);
+            ssharp.lod_bias.Assign(static_cast<u64>(static_cast<s32>(std::lround(biased * 256.0f)) & 0x3fff));
         }
         // Sampler memo: the handle found for an S# (and border color base) while no sampler
         // was deleted, without the cache lock.
@@ -4771,6 +4917,59 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    // Drawing below the output size (IssTemporal::Upscaler::Redirect*): the targets of this draw may be
+    // output-size twins; then its viewport, scissor and screen-space positions are scaled to match.
+    bool ui_active = iss_temporal && iss_temporal->UiActive();
+    bool ui_redirected = false;
+    iss_ui_scale_x = iss_ui_scale_y = 1.0f;
+    if (ui_active) {
+        // All or nothing: every target of the render size in this draw goes to its twin, or the redirection
+        // is given up for the rest of the frame (the presenter then shows the guest's buffer).
+        u32 fit = 0, other = 0;
+        const char* why = nullptr;
+        for (auto cb = 0u; cb < state.num_color_attachments && !why; ++cb) {
+            auto& [image_id, desc] = cb_descs[cb];
+            if (!image_id) {
+                continue;
+            }
+            if (texture_cache.GetImage(image_id).binding.needs_rebind) {
+                image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+            }
+            switch (iss_temporal->ClassifyColor(image_id, desc.view_info)) {
+            case IssTemporal::UiFit::Yes:
+                ++fit;
+                break;
+            case IssTemporal::UiFit::No:
+                why = "a colour target of the render size has no usable output-size twin";
+                break;
+            default:
+                ++other;
+                break;
+            }
+        }
+        if (!why && db_desc.first) {
+            switch (iss_temporal->ClassifyDepth(db_desc.first)) {
+            case IssTemporal::UiFit::Yes:
+                ++fit;
+                break;
+            case IssTemporal::UiFit::No:
+                why = "the depth target of the render size has no usable output-size twin";
+                break;
+            default:
+                if (state.num_color_attachments) {
+                    ++other;
+                }
+                break;
+            }
+        }
+        if (!why && fit && other) {
+            why = "a draw mixes targets of the render size with others";
+        }
+        if (why) {
+            iss_temporal->AbortRedirect(why);
+            ui_active = false;
+        }
+    }
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -4784,6 +4983,25 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         texture_cache.UpdateImage(image_id);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
+        IssTemporal::UiTarget ui_target;
+        if (ui_active && iss_temporal->ClassifyColor(image_id, desc.view_info) == IssTemporal::UiFit::Yes &&
+            iss_temporal->RedirectColor(image_id, desc.view_info, ui_target)) {
+            const auto& col_buf = regs.color_buffers[cb];
+            const bool is_clear = texture_cache.ConsumeMetaClear(col_buf.CmaskAddress(), 0);
+            state.width = std::min<u32>(state.width, ui_target.width);
+            state.height = std::min<u32>(state.height, ui_target.height);
+            state.num_layers = std::min<u32>(state.num_layers, 1u);
+            const auto clear_value =
+                is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
+            auto& attachment = state.color_attachments[cb];
+            attachment.image_view = ui_target.view;
+            attachment.image_layout = ui_target.layout;
+            attachment.clear_value = clear_value.color.uint32;
+            attachment.is_clear = is_clear;
+            image->usage.render_target = 1u;
+            ui_redirected = true;
+            continue;
+        }
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
@@ -4855,22 +5073,29 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
-        needs_barrier |= runtime.Transit(&image, new_layout,
-                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+        IssTemporal::UiTarget ui_depth;
+        const bool depth_redirected = ui_active &&
+                                      iss_temporal->ClassifyDepth(image_id) == IssTemporal::UiFit::Yes &&
+                                      iss_temporal->RedirectDepth(image_id, ui_depth);
+        if (!depth_redirected) {
+            needs_barrier |= runtime.Transit(&image, new_layout,
+                                             vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                                 vk::PipelineStageFlagBits2::eLateFragmentTests,
+                                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                                 vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+                                             desc.view_info.range);
+        }
 
-        state.width = std::min<u32>(state.width, image.info.size.width);
-        state.height = std::min<u32>(state.height, image.info.size.height);
+        state.width = std::min<u32>(state.width, depth_redirected ? ui_depth.width : image.info.size.width);
+        state.height = std::min<u32>(state.height, depth_redirected ? ui_depth.height : image.info.size.height);
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
 
         auto& attachment = state.depth_stencil_attachment;
-        attachment.image_view = *image_view.image_view;
-        attachment.image_layout = image.backing->state.layout;
+        attachment.image_view = depth_redirected ? ui_depth.view : *image_view.image_view;
+        attachment.image_layout = depth_redirected ? ui_depth.layout : image.backing->state.layout;
         attachment.clear_value = {};
         attachment.is_clear = 0;
+        ui_redirected |= depth_redirected;
 
         if (regs.depth_buffer.DepthValid()) {
             attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
@@ -4884,15 +5109,53 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
 
         image.usage.depth_target = true;
+        if (TlgSettings::Get().iss_temporal.load(std::memory_order_relaxed) && regs.depth_buffer.DepthValid() &&
+            regs.depth_control.depth_write_enable) {
+            iss_depth_targets.Note(image.info.guest_address, image.info.size.width, image.info.size.height);
+        }
     } else {
         state.depth_stencil_attachment = {};
     }
 
+    // Report scene color+depth dimensions independently of host output scaling.
+    static bool native_scene_reported=false;
+    if(!native_scene_reported && runtime_native_status()==1 && state.num_color_attachments &&
+       state.depth_stencil_attachment.has_depth){
+        const auto* p=runtime_native_plan();
+        if(state.width==p->width && state.height==p->height){
+            std::fprintf(stderr,"NATIVE_SCENE_TARGETS color+depth=%ux%u viewport=%.0fx%.0f (before host presentation)\n",
+                state.width,state.height,std::abs(regs.viewports[0].xscale*2.0f),std::abs(regs.viewports[0].yscale*2.0f));
+            native_scene_reported=true;
+        }
+    }
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
     }
+    if (ui_redirected) {
+        iss_ui_scale_x = iss_temporal->UiScaleX();
+        iss_ui_scale_y = iss_temporal->UiScaleY();
+        // The twins are plain General-layout images: one pass must be over before the next one uses what it wrote.
+        if (!iss_ui_last_valid || !(state == iss_ui_last_state) || iss_temporal->UiSampledPending()) {
+            iss_temporal->UiBarrier();
+        }
+        iss_ui_last_state = state;
+        iss_ui_last_valid = true;
+    } else {
+        iss_ui_last_valid = false;
+        // A draw that is not redirected can still read a twin written by the pass before it.
+        if (iss_temporal && iss_temporal->UiSampledPending()) {
+            iss_temporal->UiBarrier();
+        }
+    }
 
     return state;
+}
+
+void Rasterizer::IssUiScalePushData() {
+    push_data.xoffset *= iss_ui_scale_x;
+    push_data.xscale *= iss_ui_scale_x;
+    push_data.yoffset *= iss_ui_scale_y;
+    push_data.yscale *= iss_ui_scale_y;
 }
 
 void Rasterizer::Resolve() {
@@ -5818,7 +6081,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         return value && value[0] == '1';
     }();
     auto& native = native_draw_state;
-    const bool eligible = enabled && !cp_split_enabled && !native.failed;
+    const bool eligible = enabled && !cp_split_enabled && !native.failed && iss_ui_scale_x == 1.0f;
     const u64 context_changes = DrawContextChanges();
     const bool reuse = eligible && native.pipeline == pipeline &&
                        native.context_changes == context_changes &&
@@ -5964,6 +6227,12 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.height = yscale * 2.0f;
         }
 
+        if (iss_ui_scale_x != 1.0f && !regs.IsClipDisabled()) {
+            viewport.x *= iss_ui_scale_x;
+            viewport.width *= iss_ui_scale_x;
+            viewport.y *= iss_ui_scale_y;
+            viewport.height *= iss_ui_scale_y;
+        }
         viewports.push_back(viewport);
 
         auto vp_scsr = scsr;
@@ -5977,10 +6246,23 @@ void Rasterizer::UpdateViewportScissorState() const {
             vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
                                               regs.viewport_scissors[i].bottom_right_y);
         }
-        scissors.push_back({
-            .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
-            .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
-        });
+        if (iss_ui_scale_x != 1.0f) {
+            // Pixels of the guest's render size to pixels of the twin.
+            const auto sx = [&](s32 v) { return static_cast<s32>(std::lround(v * iss_ui_scale_x)); };
+            const auto sy = [&](s32 v) { return static_cast<s32>(std::lround(v * iss_ui_scale_y)); };
+            const s32 left = sx(vp_scsr.top_left_x), top = sy(vp_scsr.top_left_y);
+            const s32 right = sx(static_cast<s32>(vp_scsr.top_left_x) + static_cast<s32>(vp_scsr.GetWidth()));
+            const s32 bottom = sy(static_cast<s32>(vp_scsr.top_left_y) + static_cast<s32>(vp_scsr.GetHeight()));
+            scissors.push_back({
+                .offset = {left, top},
+                .extent = {static_cast<u32>(std::max(right - left, 0)), static_cast<u32>(std::max(bottom - top, 0))},
+            });
+        } else {
+            scissors.push_back({
+                .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
+                .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
+            });
+        }
     }
 
     if (viewports.empty()) {
@@ -6147,6 +6429,21 @@ void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) cons
     dynamic_state.SetAttachmentFeedbackLoopEnabled(attachment_feedback_loop);
 }
 
+void Rasterizer::IssTemporalMarker(const u32* payload, u32 dwords) {
+    if (!TlgSettings::Get().iss_temporal || !IssTemporal::Available()) {
+        return;
+    }
+    // The marker stands where the game's anti-aliasing would have been recorded: everything before
+    // it is recorded first, and the images change under the cached bindings.
+    BumpBindEpoch();
+    DrainDrawPipe(5);
+    fast_draw.valid = false;
+    if (!iss_temporal) {
+        iss_temporal = std::make_unique<IssTemporal::Upscaler>(instance, scheduler, runtime, texture_cache);
+    }
+    iss_temporal->OnMarker(payload, dwords, iss_depth_targets);
+}
+
 void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) {
     DrainDrawPipe(5);
     if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
@@ -6212,6 +6509,9 @@ bool Rasterizer::IsGpuCommandProcessorThreadId(u32 thread_id) {
 
 } // namespace Vulkan
 
+bool IssTemporalRedirecting() {
+    return Vulkan::IssTemporal::Redirecting();
+}
 void IssEngineMarker(const u32* payload) {
     Vulkan::EngineMarker(payload);
 }

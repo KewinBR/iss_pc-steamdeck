@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "infamous_renderer/native_instanced_feature.h"
 #include "native_gbuffer.h"
+#include "iss_temporal_dlss.h"
 
 #include <vk_mem_alloc.h>
 
@@ -30,6 +31,8 @@ thread_local u32 pool_family = ~0u;
 }
 
 namespace Vulkan {
+extern bool g_iss_surface_capabilities2;
+bool g_iss_full_screen_exclusive=false;
 
 /// GPU black box (gpu_blackbox.h, ISS_GPU_BLACKBOX unless =0): VK_AMD_buffer_marker enabled.
 bool g_iss_amd_buffer_marker = false;
@@ -269,6 +272,9 @@ bool Instance::CreateDevice() {
     // Required
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+#ifdef _WIN32
+    g_iss_full_screen_exclusive=g_iss_surface_capabilities2 && add_extension("VK_EXT_full_screen_exclusive");
+#endif
     ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME),
@@ -276,6 +282,10 @@ bool Instance::CreateDevice() {
                VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    // NVIDIA DLSS (iss_temporal_backend=1 with the player's DLLs): the extensions NGX needs. Empty otherwise.
+    for (const std::string& name : IssTemporal::Dlss::RequiredDeviceExtensions(*instance, physical_device)) {
+        add_extension(name);
+    }
 
     const auto robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
     ASSERT_MSG(robustness2_features.robustBufferAccess2,
@@ -529,6 +539,9 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                // FSR 3 (gpu/iss_temporal_upscaler.cpp) writes its accumulate output to storage images
+                // without a declared format.
+                .shaderStorageImageWriteWithoutFormat = features.shaderStorageImageWriteWithoutFormat,
                 .shaderClipDistance = features.shaderClipDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
@@ -711,6 +724,7 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+    IssTemporal::Dlss::Initialize(*instance, physical_device, *device);
     iss::native_geometry::RegisterIndirectFirstInstanceFeature(
         *this, request_indirect_first_instance && features.drawIndirectFirstInstance);
     if (request_indirect_first_instance && features.drawIndirectFirstInstance) {
@@ -936,6 +950,20 @@ u64 Instance::GetDeviceMemoryUsage() const {
         total_usage += memory_budget_props.heapUsage[heap];
     }
     return total_usage;
+}
+
+u64 Instance::GetDeviceMemoryBudgetNow() const {
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &memory_budget_props,
+    };
+    physical_device.getMemoryProperties2(&props);
+
+    u64 total_budget = 0;
+    for (const size_t heap : valid_heaps) {
+        total_budget += memory_budget_props.heapBudget[heap];
+    }
+    return total_budget;
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

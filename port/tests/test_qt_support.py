@@ -288,6 +288,15 @@ class KnownIssuesTests(unittest.TestCase):
                          ('AMD Radeon RX 580 Series', 'AMD', 'AMD proprietary driver 24.9.1', '1.3', 8.0))
         self.assertIsNone(report.gpu_info(run=mock.Mock(side_effect=FileNotFoundError)))
 
+    def test_nvidia_vram_comes_from_nvidia_smi_without_the_long_vulkaninfo(self):
+        summary = ('Devices:\n========\nGPU0:\n\tapiVersion         = 1.4.357\n\tvendorID           = 0x10de\n'
+                   '\tdeviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\n\tdeviceName         = NVIDIA GeForce RTX 2060\n'
+                   '\tdriverName         = NVIDIA\n\tdriverInfo         = 621.01\n')
+        stub = mock.Mock(side_effect=[mock.Mock(stdout=summary), mock.Mock(stdout='6144\n')])
+        info = report.gpu_info(run=stub)
+        self.assertEqual((info['name'], info['vendor'], info['vram_gb']), ('NVIDIA GeForce RTX 2060', 'NVIDIA', 6.0))
+        self.assertEqual(stub.call_count, 2)   # --summary and nvidia-smi; the plain vulkaninfo never starts
+
     def test_cpu_features_from_cpuinfo_and_probe(self):
         name, flags = report.parse_cpuinfo('model name\t: AMD Ryzen 5\nflags\t\t: fpu sse4a avx2 f16c movbe abm\n')
         self.assertEqual(name, 'AMD Ryzen 5')
@@ -427,8 +436,11 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(self.error_kind(error=urllib.error.URLError(socket.timeout())), 'timeout')
         self.assertEqual(self.error_kind(error=socket.timeout()), 'timeout')
         self.assertEqual(self.error_kind(error=ConnectionResetError()), 'offline')
-        for code, kind in ((404, 'none'), (403, 'limit'), (429, 'limit'), (500, 'http')):
-            self.assertEqual(self.error_kind(error=urllib.error.HTTPError('u', code, 'x', {}, None)), kind)
+        # a 403 is the rate limit only when GitHub says so (X-RateLimit-Remaining 0 or Retry-After)
+        limited = {'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1792559606'}
+        for code, headers, kind in ((404, {}, 'none'), (403, limited, 'limit'), (403, {'Retry-After': '60'}, 'limit'),
+                                    (403, {}, 'http'), (429, {}, 'limit'), (500, {}, 'http')):
+            self.assertEqual(self.error_kind(error=urllib.error.HTTPError('u', code, 'x', headers, None)), kind)
         self.assertEqual(self.error_kind(payload=b'<html>not json</html>'), 'bad')
         self.assertEqual(self.error_kind(payload={'no': 'tag'}), 'bad')
 

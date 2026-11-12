@@ -49,6 +49,11 @@ class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
+    /// iss: discrete cards up to this budget keep RESIDENCY_HEADROOM of VRAM out of the
+    /// collector's reach, for buffers (guest memory becomes resident in large ranges) and the
+    /// swapchain. 8 GB cards (RX 6600, RTX 5050/5060) reached 6.4 GB of a 6.4 GB budget.
+    static constexpr s64 SMALL_CARD_MEMORY = 12_GB;
+    static constexpr s64 RESIDENCY_HEADROOM = 1_GB + 512_MB;
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
@@ -120,6 +125,13 @@ public:
 
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
+
+    /// The single-sample image of this size that starts exactly at `address` and has `required_usage`.
+    /// One guest address can hold several images (the same memory as a render target and as a texture of
+    /// another format, a replaced image): the most recently used one wins, so unlike FindImageFromRange
+    /// with a size of 1 the lookup does not fail when there are two. Null when none matches.
+    [[nodiscard]] ImageId FindImageAt(VAddr address, u32 width, u32 height,
+                                      vk::ImageUsageFlags required_usage = {});
 
     // C may only use this as a negative hint while preparing a packet. A NoRegisteredPage
     // result must be rechecked at the coherence commit; it does not pin the registry.
@@ -532,6 +544,8 @@ private:
     }
 
     void GarbageCollectImages();
+    void RefreshGcLimits();
+    bool ImageBudgetMode() const;
     void GarbageCollectSamplers();
 
 private:
@@ -551,6 +565,22 @@ private:
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    /// iss: the limits before RefreshGcLimits applies the forced budget and the headroom.
+    u64 base_trigger_gc_memory = 0;
+    u64 base_pressure_gc_memory = 0;
+    u64 base_critical_gc_memory = 0;
+    u64 card_budget_memory = 0;
+    /// ISS_GC_BUDGET_MB (the launcher's VRAM budget), 0 when unset.
+    u64 forced_gc_budget = 0;
+    /// ISS_GC_BUDGET_MB=auto: the texture budget follows the device (RefreshGcLimits).
+    bool auto_gc_budget = false;
+    /// The texture budget the automatic mode computed last (0 outside it).
+    u64 auto_budget_memory = 0;
+    /// iss: the device usage above which the collector runs critical whatever the image bytes
+    /// (image budget mode, see GarbageCollectImages).
+    u64 device_guard_memory = 0;
+    /// iss: bytes of the registered images (total_used_memory is the whole device's usage).
+    u64 image_bytes = 0;
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;

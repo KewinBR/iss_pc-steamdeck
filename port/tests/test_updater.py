@@ -8,7 +8,9 @@ import os
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -28,9 +30,10 @@ EXE = 'inFAMOUS Second Son'
 
 
 class FakeResponse(io.BytesIO):
-    def __init__(self, data, url='https://objects.githubusercontent.com/x'):
+    def __init__(self, data, url='https://objects.githubusercontent.com/x', headers=None):
         super().__init__(data)
         self.url = url
+        self.headers = headers or {}
 
     def geturl(self):
         return self.url
@@ -85,6 +88,58 @@ class FetchAssetsTests(unittest.TestCase):
         got = releases.fetch_latest('', opener=lambda request, timeout=None: FakeResponse(json.dumps(data).encode()))
         self.assertEqual([a['name'] for a in got['assets']], ['infamous-linux-x86_64.tar.gz'])
         self.assertEqual(got['assets'][0]['size'], 5)
+
+
+class FetchLatestTests(unittest.TestCase):
+    """The one API request: the ETag of the release seen before (a 304 costs nothing against
+    GitHub's 60 an hour per network) and which 403s are a rate limit, with its reset time."""
+
+    @staticmethod
+    def http_error(code, headers):
+        return urllib.error.HTTPError(releases.API_URL, code, 'x', headers, io.BytesIO(b'{}'))
+
+    @staticmethod
+    def raising(error, calls):
+        def open_(request, timeout=None):
+            calls.append(request)
+            raise error
+        return open_
+
+    def test_etag_is_kept_and_sent_back(self):
+        calls = []
+
+        def open_(request, timeout=None):
+            calls.append(request)
+            return FakeResponse(json.dumps({'tag_name': 'v2026.10.19-d3995fe'}).encode(), headers={'ETag': 'W/"abc"'})
+        self.assertEqual(releases.fetch_latest('v1', opener=open_)['etag'], 'W/"abc"')
+        self.assertIsNone(calls[0].get_header('If-none-match'))
+        calls.clear()
+        unchanged = releases.fetch_latest('v1', opener=self.raising(self.http_error(304, {}), calls), etag='W/"abc"')
+        self.assertIsNone(unchanged)
+        self.assertEqual(calls[0].get_header('If-none-match'), 'W/"abc"')
+
+    def test_rate_limit_carries_the_reset_time(self):
+        error = self.http_error(403, {'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1792559606'})
+        with self.assertRaises(releases.UpdateError) as caught:
+            releases.fetch_latest(opener=self.raising(error, []))
+        self.assertEqual((caught.exception.kind, caught.exception.reset), ('limit', 1792559606))
+        self.assertEqual(releases.limit_reset(403, {'Retry-After': '30'}, now=1000), 1030)   # secondary limit
+        self.assertEqual(releases.limit_reset(429, {}), 0)                                   # limit, no time given
+
+    def test_other_403_is_an_http_error(self):
+        with self.assertRaises(releases.UpdateError) as caught:
+            releases.fetch_latest(opener=self.raising(self.http_error(403, {'X-RateLimit-Remaining': '42'}), []))
+        self.assertEqual((caught.exception.kind, caught.exception.detail), ('http', '403'))
+
+    def test_messages(self):
+        t = lambda key, **fmt: (key, fmt)  # noqa: E731
+        reset = 1792559606
+        self.assertEqual(releases.error_text(releases.UpdateError('limit', '403', reset=reset), t),
+                         ('upd_err_limit_until', {'time': time.strftime('%H:%M', time.localtime(reset))}))
+        self.assertEqual(releases.error_text(releases.UpdateError('limit', '429'), t), ('upd_err_limit', {'detail': '429'}))
+        strings = json.loads((ROOT / 'launcher' / 'qt' / 'i18n' / 'strings.json').read_text(encoding='utf-8'))
+        for key, field in (('upd_err_limit_until', '{time}'), ('upd_cached', '{checked}')):
+            self.assertTrue(all(field in strings[key][lang] for lang in ('en', 'pt')), key)
 
 
 class PickTests(unittest.TestCase):
@@ -333,6 +388,32 @@ class ScreenFlowTests(unittest.TestCase):
         self.assertIn('git pull', self.updates.installHint)
         self.updates.install()
         self.assertFalse(self.updates.dialog)
+
+    def test_a_failed_check_says_the_release_shown_is_an_older_one(self):
+        self.updates.check()
+        self.pump(lambda: not self.updates.checking)
+        seen = self.updates.release['checked']
+
+        def limited(version):
+            raise releases.UpdateError('limit', '403', reset=1792559606)
+        self.updates.probes['fetch'] = limited
+        self.updates.check()
+        self.pump(lambda: not self.updates.checking)
+        self.assertEqual(self.updates.latest, 'v2026.10.15-61e8942')    # the one seen before stays on screen
+        self.assertIn(time.strftime('%H:%M', time.localtime(1792559606)), self.updates.statusText)
+        self.assertIn(seen, self.updates.statusText)                    # ... and the text says when it was seen
+        self.assertEqual(self.updates.tone, 'bad')
+
+    def test_unchanged_release_keeps_the_one_seen(self):
+        self.updates.check()
+        self.pump(lambda: not self.updates.checking)
+        self.updates.release['checked'] = '2026-10-01'
+        self.updates.probes['fetch'] = lambda version: None             # a 304: still the latest
+        self.updates.check()
+        self.pump(lambda: not self.updates.checking)
+        self.assertEqual(self.updates.latest, 'v2026.10.15-61e8942')
+        self.assertEqual(self.updates.release['checked'], time.strftime('%Y-%m-%d'))
+        self.assertNotIn('2026-10-01', self.updates.statusText)
 
     def test_download_install_restart_each_after_a_yes(self):
         self.updates.check()

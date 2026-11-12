@@ -14,6 +14,11 @@ on:
         type: boolean
         required: true
         default: false
+      beta:
+        description: 'Beta: pre-release da branch escolhida / pre-release of the chosen branch (not main)'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   # Manual runs share a separate group: a new merge cannot cancel a publication.
@@ -209,6 +214,20 @@ jobs:
           path: port/dist/infamous-windows-x86_64.zip
           if-no-files-found: error
           retention-days: 3
+
+  beta:
+    # A manual run with "beta" on a branch other than main: beta.yml builds, tests and publishes a
+    # pre-release of that branch (never Latest; posted only to the Discord beta channels, never
+    # #chat-geral). The jobs above stay skipped.
+    if: github.event_name == 'workflow_dispatch' && inputs.beta == true && github.ref != 'refs/heads/main'
+    permissions:
+      contents: write
+      pull-requests: read
+    uses: ./.github/workflows/beta.yml
+    with:
+      branch: ${{ github.ref_name }}
+    # The beta channels' Discord webhooks (DISCORD_BETA_WEBHOOK, DISCORD_BETA_CHAT_WEBHOOK).
+    secrets: inherit
 
   release:
     needs: [linux, windows]
