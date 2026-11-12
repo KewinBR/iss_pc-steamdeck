@@ -17,7 +17,10 @@ inline constexpr int MaxLevel = 14;
 class Governor {
 public:
     /// The level the governor wants as the game's lowest, 0..MaxLevel.
-    int Update(int target_fps, double fps, double draws_per_frame) {
+    /// max_level (steam-deck): the highest level it may climb to, 0..MaxLevel.
+    int Update(int target_fps, double fps, double draws_per_frame, int max_level = MaxLevel) {
+        max_level = max_level < 0 ? 0 : max_level > MaxLevel ? MaxLevel : max_level;
+        if (level_ > max_level) level_ = max_level;
         if (target_fps <= 0) {
             *this = Governor{};
             return 0;
@@ -42,7 +45,7 @@ public:
         }
         if (slow_ >= SlowSeconds && raise_cooldown_ <= 0.0) {
             const int step = fps < target_fps * VerySlowFactor ? 3 : 1;
-            level_ = level_ + step < MaxLevel ? level_ + step : MaxLevel;
+            level_ = level_ + step < max_level ? level_ + step : max_level;
             raise_cooldown_ = RaiseCooldown;
             lower_cooldown_ = LowerCooldown;
             slow_ = 0;

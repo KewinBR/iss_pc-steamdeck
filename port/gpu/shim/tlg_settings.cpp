@@ -233,6 +233,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.quality_target_fps = i <= 0 ? 0 : std::clamp(i, 20, 240);
     } else if (key == "quality_floor") {
         v.quality_floor = std::clamp(i, 0, 14);
+    } else if (key == "quality_auto_max") {
+        v.quality_auto_max = std::clamp(i, 0, 14);
+    } else if (key == "lod_scale_cap") {
+        v.lod_scale_cap = i != 0;
     } else if (key == "draw_budget") {
         v.draw_budget = std::clamp(i, 10, 100);
     } else if (key == "dyn_cull") {
@@ -489,12 +493,13 @@ void Save() {
                  int(v.easter_eggs.load()));
     std::fprintf(file,
                  "lod_scale=%.3f\nregion_lod=%.3f\nregion_fade=%.3f\nnear_clip=%.3f\nfar_clip=%.0f\n"
-                 "mip_lod_bias=%.3f\nlod_bands=%.0f,%.0f,%.0f,%.0f,%.0f,%.0f\ndyn_cull=%d\ndraw_budget=%d\nquality_floor=%d\nquality_target_fps=%d\n",
+                 "mip_lod_bias=%.3f\nlod_bands=%.0f,%.0f,%.0f,%.0f,%.0f,%.0f\ndyn_cull=%d\ndraw_budget=%d\nquality_floor=%d\nquality_target_fps=%d\n"
+                 "quality_auto_max=%d\nlod_scale_cap=%d\n",
                  v.lod_scale.load(), v.region_lod.load(), v.region_fade.load(), v.near_clip.load(),
                  v.far_clip.load(), v.mip_lod_bias.load(), v.lod_bands[0].load(), v.lod_bands[1].load(),
                  v.lod_bands[2].load(), v.lod_bands[3].load(), v.lod_bands[4].load(), v.lod_bands[5].load(),
                  v.dyn_cull.load(), v.draw_budget.load(), v.quality_floor.load(),
-                 v.quality_target_fps.load());
+                 v.quality_target_fps.load(), v.quality_auto_max.load(), int(v.lod_scale_cap.load()));
     // Fixes: applied on the next start by the launcher (TLG_BPnn / TLG_<NAME>); only the ones
     // the player or the launcher chose are written.
     for (int n = 0; n < kBackportPrefs; ++n) {

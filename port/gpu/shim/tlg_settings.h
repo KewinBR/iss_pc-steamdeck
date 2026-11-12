@@ -177,6 +177,12 @@ struct Values {
     std::atomic<int> quality_floor{1};
     /// Frame rate the automatic quality aims for (tlg_quality.h); 0 = off. Live.
     std::atomic<int> quality_target_fps{0};
+    /// steam-deck: highest level the automatic quality may push the game to (0..14, 14 = no limit). Above ~4 the
+    /// LOD gets short enough that objects close to the camera swap models or vanish (Kewin, 2026-11-12). Live.
+    std::atomic<int> quality_auto_max{14};
+    /// steam-deck: lod_scale as a ceiling (each level's LOD = min(the game's own, level 0's x scale)) instead of a
+    /// multiplier on every level: the game's lighter levels are not shortened twice. Live.
+    std::atomic<bool> lod_scale_cap{false};
     /// Extra texture LOD bias of the game's draws (vk_rasterizer.cpp), any game.
     std::atomic<float> mip_lod_bias{0.0f};
 

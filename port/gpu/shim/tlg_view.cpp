@@ -58,8 +58,12 @@ void PutInt(uint32_t at, int32_t value) {
 void Apply() {
     const auto& s = TlgSettings::Get();
     const float scale = TlgView::ClampLodScale(s.lod_scale);
+    // steam-deck: lod_scale_cap keeps the scale as a ceiling (level 0's value x scale) over the game's own values.
+    const bool cap = s.lod_scale_cap;
     for (unsigned r = 0; r < TLG_VIEW_LOD_ROWS; ++r) {
-        Put(TLG_VIEW_LOD_TABLE + r * TLG_VIEW_LOD_STRIDE, tlg_view_lod_original[r] * scale);
+        const float v = cap ? std::min(tlg_view_lod_original[r], tlg_view_lod_original[0] * scale)
+                            : tlg_view_lod_original[r] * scale;
+        Put(TLG_VIEW_LOD_TABLE + r * TLG_VIEW_LOD_STRIDE, v);
     }
     const int cull = s.dyn_cull;
     for (unsigned r = 0; r < TLG_VIEW_LOD_ROWS; ++r) {
@@ -145,7 +149,8 @@ extern "C" void tlg_view_start(void) {
                 last_frames = frames;
                 last_draws = draws;
                 auto_level = governor.Update(TlgSettings::Get().quality_target_fps, frame_delta / seconds,
-                                             frame_delta ? double(draw_delta) / double(frame_delta) : 0.0);
+                                             frame_delta ? double(draw_delta) / double(frame_delta) : 0.0,
+                                             TlgSettings::Get().quality_auto_max);
             }
             Apply();
             if (!log_levels) {
